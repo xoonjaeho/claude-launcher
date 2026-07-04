@@ -423,13 +423,16 @@ $modelItems  = @(); foreach ($m in $models)    { $modelItems  += "$($m.color)$($
 $effortItems = @(); foreach ($m in $efforts)   { $effortItems += "$($m.color)$($m.label)$R  ${IN}— $($m.desc)$R" }
 
 $extrasCatalog = @(
+    # Integrations
     @{ key = "ide";      label = "IDE";      desc = "Auto-connect to IDE on startup";                       flag = "--ide" }
     @{ key = "chrome";   label = "Chrome";   desc = "Enable Chrome integration (beta)";                     flag = "--chrome" }
     @{ key = "telegram"; label = "Telegram"; desc = "Load Telegram channel plugin";                         flag = "--channels plugin:telegram@claude-plugins-official" }
     @{ key = "remote";   label = "Remote";   desc = "Enable Remote Control (drive session from another device)"; flag = "--remote-control" }
+    # Diagnostics
     @{ key = "verbose";  label = "Verbose";  desc = "Enable verbose logging";                               flag = "--verbose" }
     @{ key = "bare";     label = "Bare";     desc = "Skip hooks, LSP, plugins, and CLAUDE.md discovery";    flag = "--bare" }
     @{ key = "safe";     label = "Safe";     desc = "Disable ALL customizations for troubleshooting (broader than Bare)"; flag = "--safe-mode" }
+    # Perf / UX
     @{ key = "cache";    label = "Cache";    desc = "Move per-machine context to first message for cache reuse"; flag = "--exclude-dynamic-system-prompt-sections" }
     @{ key = "brief";    label = "Brief";    desc = "Enable SendUserMessage tool (agent-to-user messages mid-task)"; flag = "--brief" }
     @{ key = "prompts";  label = "Prompts";  desc = "Suggest a predicted next prompt each turn";              flag = "--prompt-suggestions" }
@@ -474,14 +477,13 @@ function Get-PathChoices {
     $state = Get-LauncherState
     if (-not $state.perPath.ContainsKey($Path)) { return $null }
     $entry = $state.perPath[$Path]
-    $choices = @{ permission = $null; model = $null; effort = $null; extras = @() }
+    $choices = @{ permission = $null; model = $null; effort = $null }
     if ($entry -is [string]) {
         $choices.permission = $entry
     } elseif ($entry) {
         $choices.permission = $entry.permission
         $choices.model      = $entry.model
         $choices.effort     = $entry.effort
-        $choices.extras     = if ($entry.extras) { [string[]]$entry.extras } else { @() }
     }
     return $choices
 }

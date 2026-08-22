@@ -37,7 +37,7 @@ claude-launcher.bat
 
 ```
 ▐▛███▜▌   Claude Code v2.1.101
-▝▜█████▛▘  Opus 4.8 (1M) with ultracode effort · Claude Max
+▝▜█████▛▘  Opus 5 with ultracode effort · Claude Max
   ▘▘ ▝▝    you@example.com
 ```
 
@@ -142,9 +142,8 @@ Sets `--permission-mode`.
 
 ### Model tab
 
-Sets `--model`. Offers `inherit` plus the model catalog: `opusplan`, Fable 5, Opus 4.8 /
-4.7 (including 1M-context variants), Sonnet 5 and Sonnet 4.6 (each including a 1M
-variant), Haiku 4.5, and the `fable` / `opus` / `sonnet` / `haiku` latest aliases.
+Sets `--model`. Offers `inherit` plus the model catalog: Fable 5, Opus 5, Sonnet 5 and
+Haiku 4.5.
 
 ### Effort tab
 
@@ -156,7 +155,7 @@ Sets the session effort level.
 | **auto** | Adaptive — Claude picks the effort per turn |
 | **low** | Short, scoped, latency-sensitive tasks |
 | **medium** | Reduced token use for cost-sensitive work |
-| **high** | Balanced (default for Opus 4.8) |
+| **high** | Balanced (default for Opus 5) |
 | **xhigh** | The hardest tasks |
 | **max** | Maximum reasoning; can hit diminishing returns |
 | **ultracode** | `xhigh` plus standing dynamic workflow orchestration |
@@ -165,10 +164,10 @@ Most levels are passed with `--effort`. `auto` and `ultracode` are not accepted 
 `--effort`, so the launcher injects them through a temporary `--settings` overlay
 instead.
 
-**ultracode** requires an xhigh-capable Opus or Fable model. If a non-capable model is
-selected — Sonnet, Haiku, or `opusplan` (which runs Sonnet outside plan mode) — the
-launcher overrides the model to Opus and prints a notice before launching; otherwise
-ultracode would silently fall back to plain `xhigh`.
+**ultracode** requires an xhigh-capable Opus or Fable model. If a non-capable model is in
+effect — Sonnet, Haiku, or an `opusplan` inherited from `settings.json`, which runs Sonnet
+outside plan mode — the launcher overrides the model to Opus and prints a notice before
+launching; otherwise ultracode would silently fall back to plain `xhigh`.
 
 ### Extras tab
 

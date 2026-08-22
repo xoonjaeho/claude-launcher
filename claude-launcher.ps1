@@ -121,22 +121,37 @@ function Get-OscColor {
 # Only tabs this launcher started are known — a hand-opened tab carries no custom color anyway.
 $colorStatePath = Join-Path $env:USERPROFILE ".claude\claude-launcher-colors.json"
 
-function Get-LiveTabColors {
+function ConvertTo-LiveTabColors {
     # PID *and* process start time: a reused PID must not keep holding someone else's color.
+    # Takes text, not a path, so Reserve-TabColor can pass what it read through its own
+    # exclusive handle instead of reopening the file underneath itself. Both callers read
+    # through a BOM-detecting reader, so the UTF-8 BOM older state files carry is gone by here.
+    param([string]$Raw)
     $live = @{}
-    if (Test-Path $colorStatePath) {
-        try {
-            $obj = Get-Content $colorStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $obj.PSObject.Properties | ForEach-Object {
-                $prop = $_
-                try {
-                    $proc = Get-Process -Id ([int]$prop.Name) -ErrorAction SilentlyContinue
-                    if ($proc -and "$($proc.StartTime.Ticks)" -eq "$($prop.Value.start)") { $live[$prop.Name] = $prop.Value }
-                } catch {}
-            }
-        } catch {}
-    }
+    if (-not $Raw) { return $live }
+    try {
+        $obj = $Raw | ConvertFrom-Json
+        $obj.PSObject.Properties | ForEach-Object {
+            $prop = $_
+            try {
+                $proc = Get-Process -Id ([int]$prop.Name) -ErrorAction SilentlyContinue
+                if ($proc -and "$($proc.StartTime.Ticks)" -eq "$($prop.Value.start)") { $live[$prop.Name] = $prop.Value }
+            } catch {}
+        }
+    } catch {}
     return $live
+}
+
+function Get-LiveTabColors {
+    # Retry briefly: Reserve-TabColor holds the file exclusively while it rewrites, and a
+    # sharing violation here would otherwise read as "no colors in use".
+    for ($i = 0; $i -lt 10; $i++) {
+        if (-not (Test-Path $colorStatePath)) { return @{} }
+        try { return ConvertTo-LiveTabColors ([System.IO.File]::ReadAllText($colorStatePath, [System.Text.Encoding]::UTF8)) }
+        catch [System.IO.IOException] { Start-Sleep -Milliseconds 30 }
+        catch { return @{} }
+    }
+    return @{}
 }
 
 function Get-UsedTabColors {
@@ -147,11 +162,34 @@ function Get-UsedTabColors {
 
 function Reserve-TabColor {
     param([int]$OwnerPid, [string[]]$Names)
-    $live = Get-LiveTabColors
+    $proc = Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
+    if (-not $proc) { return }
     try {
-        $proc = Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
-        if ($proc) { $live["$OwnerPid"] = @{ colors = @($Names); start = "$($proc.StartTime.Ticks)" } }
-        $live | ConvertTo-Json -Depth 4 | Set-Content -Path $colorStatePath -Encoding UTF8
+        $dir = Split-Path $colorStatePath -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        # One exclusive handle held across BOTH the read and the write. Reading and writing
+        # separately lets two launchers that start together each read the old file, and the
+        # second write then drops the first one's reservation.
+        $fs = $null
+        for ($i = 0; $i -lt 20 -and -not $fs; $i++) {
+            try { $fs = [System.IO.File]::Open($colorStatePath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+            catch [System.IO.IOException] { Start-Sleep -Milliseconds 50 }
+        }
+        # ponytail: a lost reservation only costs a duplicate color, so give up rather than
+        # stall the launch behind another launcher that is wedged.
+        if (-not $fs) { return }
+        try {
+            $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+            $live = ConvertTo-LiveTabColors $reader.ReadToEnd()
+            $live["$OwnerPid"] = @{ colors = @($Names); start = "$($proc.StartTime.Ticks)" }
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes(($live | ConvertTo-Json -Depth 4))
+            # Truncate-then-write leaves the file empty if Write fails. Accepted: Set-Content
+            # had the same window, an unreadable file reads as "nothing reserved", and the next
+            # launch rewrites it -- a compensating write would fail for the same reason.
+            $fs.SetLength(0)
+            $fs.Position = 0
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally { $fs.Dispose() }
     } catch {}
 }
 
@@ -167,6 +205,8 @@ if ($SelfTest) {
     $colorStatePath = Join-Path $env:TEMP "claude_launcher_colors_selftest.json"
     Remove-Item $colorStatePath -ErrorAction SilentlyContinue
     $me = Get-Process -Id $PID
+    # Set-Content -Encoding UTF8 writes a BOM on PS 5.1, so this seed also covers reading the
+    # BOM-prefixed state files older versions left behind. Keep it that way.
     @{ "$PID"   = @{ colors = @("Teal", "Amber"); start = "$($me.StartTime.Ticks)" }
        "999999" = @{ colors = @("Red");           start = "0" } } | ConvertTo-Json -Depth 4 | Set-Content $colorStatePath -Encoding UTF8
 
@@ -179,6 +219,29 @@ if ($SelfTest) {
         if (@("Teal", "Amber") -contains (Select-TabColor -Used (Get-UsedTabColors)).name) { throw "SelfTest: picked a color already in use" }
     }
     if (-not (Select-TabColor -Used ($tabPalette | ForEach-Object { $_.name }))) { throw "SelfTest: exhausted palette returned nothing" }
+
+    # Reserve now writes bytes through its own handle: prove the reader still reads them back.
+    Reserve-TabColor -OwnerPid $PID -Names @("Green", "Pink")
+    if ((Get-UsedTabColors) -join "," -ne "Green,Pink") { throw "SelfTest: reserve round-trip lost colors ($((Get-UsedTabColors) -join ','))" }
+
+    # Releasing keeps the owner but empties its list; dropping the entry would be wrong too.
+    Reserve-TabColor -OwnerPid $PID -Names @()
+    $released = Get-LiveTabColors
+    if (-not $released.ContainsKey("$PID")) { throw "SelfTest: release dropped the owner entry" }
+    if (@($released["$PID"].colors).Count -ne 0) { throw "SelfTest: release left colors behind" }
+    if ((Get-UsedTabColors).Count -ne 0) { throw "SelfTest: released colors still counted as used" }
+
+    # The rewrite must happen under an EXCLUSIVE handle, or two launchers starting together
+    # both read the old file and the second write drops the first one's reservation. Hold the
+    # file open with sharing ALLOWED: an exclusive open then cannot be granted, so Reserve has
+    # to decline and leave the file untouched.
+    Reserve-TabColor -OwnerPid $PID -Names @("Blue")
+    $sentinel = [System.IO.File]::ReadAllText($colorStatePath, [System.Text.Encoding]::UTF8)
+    $held = [System.IO.File]::Open($colorStatePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+    try { Reserve-TabColor -OwnerPid $PID -Names @("Amber") } finally { $held.Dispose() }
+    if ([System.IO.File]::ReadAllText($colorStatePath, [System.Text.Encoding]::UTF8) -ne $sentinel) {
+        throw "SelfTest: reservation rewritten while another handle was open (not exclusive)"
+    }
 
     Remove-Item $colorStatePath -ErrorAction SilentlyContinue
     Write-Host "SelfTest OK"
@@ -972,8 +1035,17 @@ $effortEnv = $selectedEffort
 # longer shows, blocking it for every other session.
 $ownerPid = $PID
 if ($FromBat) {
-    # The launch .bat runs in the parent cmd.exe, which is what outlives this script.
-    $parent = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue).ParentProcessId
+    # The launch .bat runs in the parent cmd.exe, which is what outlives this script. Falling
+    # back to $PID would reserve under a process that exits the moment this script does, so the
+    # next launcher prunes the entry and hands the color out again mid-session. Try WMI when
+    # CIM is unavailable before settling for that.
+    $parent = $null
+    try { $parent = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId } catch {}
+    if (-not $parent) {
+        try { $parent = (Get-WmiObject Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId } catch {}
+    }
+    # If BOTH queries fail we knowingly keep $PID. That is no worse than skipping the
+    # reservation: either way the color ends up unreserved and can be handed out twice.
     if ($parent) { $ownerPid = [int]$parent }
 }
 Reserve-TabColor -OwnerPid $ownerPid -Names @($selectedTabColor.name, $selectedBgColor.name | Where-Object { $_ })

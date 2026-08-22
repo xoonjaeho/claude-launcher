@@ -157,27 +157,16 @@ try {
     }
 } catch {}
 if (-not $modelDisplay) {
-    $defaultModels = @{ "max"="claude-opus-4-8"; "pro"="claude-sonnet-4-6"; "team"="claude-sonnet-4-6"; "enterprise"="claude-sonnet-4-6" }
+    $defaultModels = @{ "max"="claude-opus-5"; "pro"="claude-sonnet-5"; "team"="claude-sonnet-5"; "enterprise"="claude-sonnet-5" }
     if ($sub -and $defaultModels.ContainsKey($sub)) { $modelDisplay = $defaultModels[$sub] }
 }
 
 # --- Model catalog (single source of truth for header + tab menu) ---
 $modelCatalog = @(
-    @{ id = "claude-fable-5";            name = "Fable 5";               tier = "fable" }
-    @{ id = "opusplan";                  name = "opusplan";              tier = "opus";   desc = "Opus for plan mode, Sonnet otherwise" }
-    @{ id = "claude-opus-4-8[1m]";       name = "Opus 4.8 (1M)";         tier = "opus" }
-    @{ id = "claude-opus-4-8";           name = "Opus 4.8";              tier = "opus" }
-    @{ id = "claude-opus-4-7[1m]";        name = "Opus 4.7 (1M)";         tier = "opus" }
-    @{ id = "claude-opus-4-7";           name = "Opus 4.7";              tier = "opus" }
-    @{ id = "claude-sonnet-5[1m]";       name = "Sonnet 5 (1M)";         tier = "sonnet" }
-    @{ id = "claude-sonnet-5";           name = "Sonnet 5";              tier = "sonnet" }
-    @{ id = "claude-sonnet-4-6[1m]";    name = "Sonnet 4.6 (1M)";       tier = "sonnet" }
-    @{ id = "claude-sonnet-4-6";         name = "Sonnet 4.6";            tier = "sonnet" }
-    @{ id = "claude-haiku-4-5-20251001"; name = "Haiku 4.5";             tier = "haiku" }
-    @{ id = "fable";                     name = "Fable (latest)";        tier = "fable" }
-    @{ id = "opus";                      name = "Opus (latest)";         tier = "opus" }
-    @{ id = "sonnet";                    name = "Sonnet (latest)";       tier = "sonnet" }
-    @{ id = "haiku";                     name = "Haiku (latest)";        tier = "haiku" }
+    @{ id = "claude-fable-5";            name = "Fable 5";   tier = "fable" }
+    @{ id = "claude-opus-5";             name = "Opus 5";    tier = "opus" }
+    @{ id = "claude-sonnet-5";           name = "Sonnet 5";  tier = "sonnet" }
+    @{ id = "claude-haiku-4-5-20251001"; name = "Haiku 4.5"; tier = "haiku" }
 )
 $modelNames = @{}
 foreach ($m in $modelCatalog) { $modelNames[$m.id] = $m.name }
@@ -412,8 +401,8 @@ $efforts = @(
     @{ key="auto";   label="auto";    desc="Adaptive — Claude picks effort per turn";            color=$EffortColors["auto"]   }
     @{ key="low";    label="low";     desc="Short, scoped, latency-sensitive tasks";             color=$EffortColors["low"]    }
     @{ key="medium"; label="medium";  desc="Reduced token usage for cost-sensitive work";        color=$EffortColors["medium"] }
-    @{ key="high";   label="high";    desc="Default for Opus 4.8 — balanced intelligence";       color=$EffortColors["high"]   }
-    @{ key="xhigh";  label="xhigh";   desc="For the hardest tasks (Opus 4.8 recommended)";       color=$EffortColors["xhigh"]  }
+    @{ key="high";   label="high";    desc="Default for Opus 5 — balanced intelligence";         color=$EffortColors["high"]   }
+    @{ key="xhigh";  label="xhigh";   desc="For the hardest tasks (Opus 5 recommended)";         color=$EffortColors["xhigh"]  }
     @{ key="max";    label="max";     desc="Maximum reasoning; may lead to diminishing returns"; color=$EffortColors["max"]    }
     @{ key="ultracode"; label="ultracode"; desc="xhigh + standing dynamic workflows (needs an xhigh-capable Opus model)"; color=$EffortColors["ultracode"] }
 )

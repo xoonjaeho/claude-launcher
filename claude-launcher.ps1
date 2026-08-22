@@ -416,8 +416,14 @@ function Show-Menu {
     param([string[]]$MenuItems, [int]$Start = 0, [string]$EscLabel = "quit")
 
     $cursor = $Start
-    $top = [Console]::CursorTop
     $hint = "   ${IN}[↑↓] move  [1-9] jump  [Enter] select  [Esc] $EscLabel$R$ESC[K"
+
+    # Render draws $MenuItems.Count + 2 lines down from $top. Scroll that space in now: in a
+    # short window the buffer would otherwise scroll on the last line of every frame, leaving
+    # $top one row stale each time and stranding the previous frame's first item above the menu.
+    $renderRows = $MenuItems.Count + 2
+    for ($i = 0; $i -lt $renderRows; $i++) { Write-Host "" }
+    $top = [Math]::Max(0, [Console]::CursorTop - $renderRows)
 
     Write-Host "$ESC[?25l" -NoNewline
 
@@ -484,7 +490,10 @@ function Browse-Directory {
         Write-Host "   ${IN}[↑↓] move  [Enter] open  [Space] select here  [Esc] back$R"
         Write-Host ""
 
-        $top = [Console]::CursorTop
+        # Same reservation as Show-Menu: pre-scroll the rows Render-Tree redraws so $top stays valid.
+        $renderRows = $dirNames.Count
+        for ($i = 0; $i -lt $renderRows; $i++) { Write-Host "" }
+        $top = [Math]::Max(0, [Console]::CursorTop - $renderRows)
         $cursor = 0
 
         Write-Host "$ESC[?25l" -NoNewline

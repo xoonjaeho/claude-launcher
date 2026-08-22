@@ -53,6 +53,46 @@ claude-launcher.bat
 | `1`-`9` | Jump to that item |
 | `Enter` | Select the current item |
 | `Esc` | Go back one step (quit at the top level) |
+| Click | Select the item under the pointer — same as `Enter` |
+| Wheel | Move between items |
+
+## Tests
+
+| Command | Covers |
+|---------|--------|
+| `claude-launcher.ps1 -SelfTest` | The pure parts: INPUT_RECORD decoding, viewport clamping, tab-bar column ranges. Fast, no console needed. |
+| `claude-launcher.tests.ps1` | The rest: it starts a real launcher, writes console records into its input buffer, and reads the rendered screen back to assert. Runs `-SelfTest` first. |
+
+The second one exists because the first cannot see a screen. Several defects found during the
+mouse work were invisible to `-SelfTest`: a `return ,$segs` that made
+`Get-TabSegments | Where-Object` receive one array instead of four segments, a `$r` loop counter
+silently overwriting `$R`, the ANSI reset (PowerShell variable names are case-insensitive), and a
+press queued before a screen change acting on the screen that replaced it.
+
+Wheel scrolling needs a directory listing longer than the console, so the suite creates 60 empty
+directories next to the launcher and removes them afterwards.
+
+## Mouse
+
+Every screen takes the mouse as well as the keyboard. `ReadKey` discards mouse events, so the
+launcher reads console input records directly and turns on `ENABLE_MOUSE_INPUT`.
+
+A single click is `Enter`. A click is the button's **0 → 1 transition**, not "the left bit is set":
+`dwButtonState` reports the whole current mask, so holding left while clicking right reports
+`1, 3, 1, 0` and testing the bit alone turned one gesture into three clicks. Double-click and
+drag-move records update that state but never fire, so one physical gesture is one action.
+
+Input queued **before** a screen change is discarded — the buffer is flushed as each screen takes
+over. Without it, a press made before the transition was read by the *next* screen at stale
+coordinates, and with click = Enter that cascaded. Type-ahead across a screen change goes too;
+that is the intended trade.
+
+The click that gives the console focus is still delivered, so on the configuration screen it can
+launch a session.
+
+Turning mouse input on also means drag-to-select is off **while a menu is up** — the terminal would otherwise swallow
+every drag before the script saw it. The previous console mode is restored the moment a menu
+exits, including on the `-FromBat` handoff, so copy/paste in the Claude session is untouched.
 
 ## Flow
 
@@ -98,6 +138,11 @@ Selecting `🔍 Browse` opens a file-system tree browser.
 | `Enter` | Open directory |
 | `Space` | Select the current directory |
 | `Esc` | Back |
+| Click | Open the entry under the pointer — same as `Enter` |
+| Wheel | Scroll the list |
+
+Long directories are windowed to the console height, with a `12-33 / 88` position line under
+the list. `Space` selects the *current* directory and has no mouse equivalent.
 
 ## Tabbed configuration
 
@@ -112,6 +157,13 @@ Claude Code option.
 | `Space` | Toggle an extra — or cycle the Color option (Extras tab only) |
 | `Enter` | Launch with the current selection |
 | `Esc` | Back |
+| Click on the tab bar | Switch to that tab |
+| Click on an item | Launch with that item selected — or, on the Extras tab, toggle it |
+| | (the footer says `[Enter] launch` on Extras and `[Enter/click] launch` elsewhere, to match) |
+| Wheel | Move within a tab |
+
+A click is `Enter`, so on a single-select tab it picks the item **and launches**. Extras rows are
+checkboxes; a click there toggles instead, or the boxes would have no mouse equivalent at all.
 
 Every single-select tab has an **inherit** option that leaves the corresponding
 `~/.claude/settings.json` value untouched (no flag is passed).

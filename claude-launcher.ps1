@@ -201,6 +201,134 @@ function Select-TabColor {
     return $free[(Get-Random -Maximum $free.Count)]
 }
 
+# --- Console input: keyboard + mouse ---
+# $Host.UI.RawUI.ReadKey() reads console input records and then DISCARDS every mouse event, so
+# mouse support means reading the records directly. ENABLE_EXTENDED_FLAGS *without*
+# ENABLE_QUICK_EDIT_MODE is what turns drag-to-select off; leave quick edit on and the terminal
+# eats every drag before the script sees it. ENABLE_PROCESSED_INPUT stays set or Ctrl+C dies.
+if (-not ('CL.Con' -as [type])) {
+    Add-Type -Namespace CL -Name Con -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hHandle, uint dwMode);
+[DllImport("kernel32.dll", SetLastError = true, EntryPoint = "ReadConsoleInputW")]
+public static extern bool ReadConsoleInput(IntPtr hHandle, byte[] lpBuffer, uint nLength, out uint lpNumberOfEventsRead);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool FlushConsoleInputBuffer(IntPtr hHandle);
+'@
+}
+
+$STDIN_HANDLE = [CL.Con]::GetStdHandle(-10)
+$MOUSE_MODE   = 0x0001 -bor 0x0010 -bor 0x0080   # PROCESSED_INPUT | MOUSE_INPUT | EXTENDED_FLAGS
+$inputRecord  = New-Object byte[] 20             # sizeof(INPUT_RECORD) on x86 and x64 alike
+$savedMode    = $null                            # $null, not 0: a real mode of 0 must still restore
+$leftButtonDown = $false                         # see ConvertFrom-InputRecord: clicks are transitions
+
+# Enable/Restore are called from each menu loop's own try/finally instead of once around the
+# whole script: there are three top-level `exit 0` paths, and under -FromBat the SAME console is
+# handed to cmd.exe. A mode left unrestored follows the user into the Claude session with
+# drag-select still disabled.
+function Enable-MouseInput {
+    # Save the caller's mode ONCE. Re-saving on every entry means that if a restore ever fails, the
+    # next entry captures the MOUSE mode as though it were the user's, and every later "restore"
+    # then restores mouse mode -- the original is gone and the console never recovers.
+    if ($null -eq $script:savedMode) {
+        $mode = [uint32]0
+        if (-not [CL.Con]::GetConsoleMode($STDIN_HANDLE, [ref]$mode)) { return $false }
+        $script:savedMode = $mode
+    }
+    $script:leftButtonDown = $false
+    # Anything queued was aimed at the screen that just closed. Without this, a press the user
+    # made before the transition is read HERE and acts on this screen at stale coordinates --
+    # measured: a queued press opened a directory on the browser that a menu click had just
+    # opened. Keystrokes go too; type-ahead across a screen change is not a feature worth a
+    # misfired launch.
+    [void][CL.Con]::FlushConsoleInputBuffer($STDIN_HANDLE)
+    return [CL.Con]::SetConsoleMode($STDIN_HANDLE, $MOUSE_MODE)
+}
+
+function Restore-ConsoleMode {
+    if ($null -ne $script:savedMode) { [CL.Con]::SetConsoleMode($STDIN_HANDLE, $script:savedMode) | Out-Null }
+}
+
+# Decodes one INPUT_RECORD. $null means "nothing a menu acts on" -- a key-up, a button-up, or a
+# plain pointer move. Those must be swallowed here: with ENABLE_MOUSE_INPUT every pixel of
+# pointer travel is an event, and returning them would repaint the menu continuously.
+function ConvertFrom-InputRecord {
+    param([byte[]]$Rec)
+    switch ([BitConverter]::ToUInt16($Rec, 0)) {
+        1 {   # KEY_EVENT: bKeyDown is a 4-byte BOOL at 4, VK at 10, UnicodeChar at 14
+            if ($Rec[4] -eq 0) { return $null }
+            return @{ Kind = "key"
+                      Vk   = [BitConverter]::ToUInt16($Rec, 10)
+                      Char = [char][BitConverter]::ToUInt16($Rec, 14) }
+        }
+        2 {   # MOUSE_EVENT: COORD at 4 (X) / 6 (Y), dwButtonState at 8, dwEventFlags at 16
+            $flags = [BitConverter]::ToUInt32($Rec, 16)
+            # MOUSE_WHEELED carries a SIGNED delta in the button-state high word; read it as
+            # Int32 and shift, or wheel-down comes back as a large positive number. Its button
+            # field is not a plain mask, so leave the click state alone on this branch.
+            if ($flags -eq 4) { return @{ Kind = "wheel"; Delta = [BitConverter]::ToInt32($Rec, 8) -shr 16 } }
+            # dwButtonState is the CURRENT full button mask, not the button that just changed.
+            # Holding left while clicking right reports 1, 3, 1, 0 -- three of those have the left
+            # bit set, and testing the bit alone turned ONE gesture into THREE clicks (measured).
+            # A click is the 0 -> 1 transition. Track it on every non-wheel record, moves included,
+            # so a release that lands outside the window still clears the state.
+            $down    = ([BitConverter]::ToUInt32($Rec, 8) -band 1) -ne 0
+            $wasDown = $script:leftButtonDown
+            $script:leftButtonDown = $down
+            # Only flags 0 reports a click. MOUSE_MOVED (1) would fire on a drag that entered the
+            # window already pressed; DOUBLE_CLICK (2) would fire a second time on whatever screen
+            # the first click just opened -- one physical double-click stays one action.
+            if ($down -and -not $wasDown -and $flags -eq 0) {
+                # ponytail: dwMousePosition is documented as screen-BUFFER coordinates, the same
+                # space as [Console]::CursorTop. Should a host ever report window-relative rows,
+                # adding [Console]::WindowTop to Row right here is the entire fix.
+                return @{ Kind = "click"
+                          Row  = [BitConverter]::ToInt16($Rec, 6)
+                          Col  = [BitConverter]::ToInt16($Rec, 4) }
+            }
+        }
+    }
+    return $null
+}
+
+function Read-Input {
+    while ($true) {
+        $read = [uint32]0
+        if (-not [CL.Con]::ReadConsoleInput($STDIN_HANDLE, $inputRecord, 1, [ref]$read)) { throw "console input unavailable" }
+        $ev = ConvertFrom-InputRecord $inputRecord
+        if ($ev) { return $ev }
+    }
+}
+
+# The tab bar's text and each tab's column range, from one place, so what gets drawn and what a
+# click lands on cannot drift apart. Columns are 0-based and the bar is indented three spaces.
+function Get-TabSegments {
+    param([string[]]$Names, [int]$Active, [int]$StartX = 3)
+    $x = $StartX
+    $segs = @()
+    for ($i = 0; $i -lt $Names.Count; $i++) {
+        $text = if ($i -eq $Active) { "[ $($Names[$i]) ]" } else { "   $($Names[$i])   " }
+        $segs += @{ Index = $i; Text = $text; Start = $x; End = $x + $text.Length - 1 }
+        $x += $text.Length + 2
+    }
+    return $segs
+}
+
+# Smallest scroll offset that keeps $Cursor inside a $ViewH-row window over $Count items.
+function Get-Scroll {
+    param([int]$Cursor, [int]$Scroll, [int]$ViewH, [int]$Count)
+    $max = [Math]::Max(0, $Count - $ViewH)
+    if ($Scroll -gt $max)             { $Scroll = $max }
+    if ($Cursor -lt $Scroll)          { $Scroll = $Cursor }
+    if ($Cursor -ge $Scroll + $ViewH) { $Scroll = $Cursor - $ViewH + 1 }
+    return $Scroll
+}
+
 if ($SelfTest) {
     $colorStatePath = Join-Path $env:TEMP "claude_launcher_colors_selftest.json"
     Remove-Item $colorStatePath -ErrorAction SilentlyContinue
@@ -244,6 +372,90 @@ if ($SelfTest) {
     }
 
     Remove-Item $colorStatePath -ErrorAction SilentlyContinue
+
+    # Input decoding and list windowing are pure, so they are checked from synthetic records
+    # rather than by clicking around a live console.
+    function New-Rec { param([uint16]$Type) $r = New-Object byte[] 20; [BitConverter]::GetBytes($Type).CopyTo($r, 0); return ,$r }
+
+    $rec = New-Rec 2
+    [BitConverter]::GetBytes([int16]17).CopyTo($rec, 6)
+    [BitConverter]::GetBytes([uint32]1).CopyTo($rec, 8)
+    [BitConverter]::GetBytes([int16]40).CopyTo($rec, 4)
+    $ev = ConvertFrom-InputRecord $rec
+    if ($ev.Kind -ne "click" -or $ev.Row -ne 17) { throw "SelfTest: left press did not decode as a click on row 17" }
+    if ($ev.Col -ne 40) { throw "SelfTest: click column lost (the tab bar hit test needs it)" }
+
+    # A click already acts as Enter, so honouring DOUBLE_CLICK too would fire Enter a second time
+    # on whatever screen the first click just opened.
+    [BitConverter]::GetBytes([uint32]2).CopyTo($rec, 16)
+    if (ConvertFrom-InputRecord $rec) { throw "SelfTest: DOUBLE_CLICK must not act as a second click" }
+
+    [BitConverter]::GetBytes([uint32]1).CopyTo($rec, 16)
+    if (ConvertFrom-InputRecord $rec) { throw "SelfTest: a pointer move must not wake the menu loop" }
+
+    # One left+right chord, as the console reports it: dwButtonState is the CURRENT mask, so the
+    # left bit is set in three of these four records. Exactly one is a new click.
+    $script:leftButtonDown = $false
+    $chord = 0
+    foreach ($state in 1, 3, 1, 0) {
+        $rec = New-Rec 2
+        [BitConverter]::GetBytes([uint32]$state).CopyTo($rec, 8)
+        if (ConvertFrom-InputRecord $rec) { $chord++ }
+    }
+    if ($chord -ne 1) { throw "SelfTest: a left+right chord decoded as $chord clicks, not 1" }
+
+    # And a plain click still is one, from a clean state.
+    $script:leftButtonDown = $false
+    $rec = New-Rec 2
+    [BitConverter]::GetBytes([uint32]1).CopyTo($rec, 8)
+    if (-not (ConvertFrom-InputRecord $rec)) { throw "SelfTest: a plain left press stopped registering" }
+    [BitConverter]::GetBytes([uint32]0).CopyTo($rec, 8)
+    if (ConvertFrom-InputRecord $rec) { throw "SelfTest: releasing the button registered as a click" }
+
+    # A drag that enters the window already pressed must not count as a press here.
+    $script:leftButtonDown = $false
+    $rec = New-Rec 2
+    [BitConverter]::GetBytes([uint32]1).CopyTo($rec, 8)
+    [BitConverter]::GetBytes([uint32]1).CopyTo($rec, 16)              # MOUSE_MOVED, button held
+    if (ConvertFrom-InputRecord $rec) { throw "SelfTest: a move with the button down decoded as a click" }
+
+    $script:leftButtonDown = $false
+    $rec = New-Rec 2
+    [BitConverter]::GetBytes([int32](-120 -shl 16)).CopyTo($rec, 8)   # wheel down: -120 in the high word
+    [BitConverter]::GetBytes([uint32]4).CopyTo($rec, 16)
+    if ((ConvertFrom-InputRecord $rec).Delta -ne -120) { throw "SelfTest: wheel-down delta lost its sign" }
+
+    $rec = New-Rec 1
+    $rec[4] = 1
+    [BitConverter]::GetBytes([uint16]40).CopyTo($rec, 10)
+    if ((ConvertFrom-InputRecord $rec).Vk -ne 40) { throw "SelfTest: key-down virtual key code lost" }
+    $rec[4] = 0
+    if (ConvertFrom-InputRecord $rec) { throw "SelfTest: key-up must not repeat the keystroke" }
+
+    if ((Get-Scroll -Cursor 0  -Scroll 0 -ViewH 10 -Count 60) -ne 0)  { throw "SelfTest: top of the list scrolled" }
+    if ((Get-Scroll -Cursor 10 -Scroll 0 -ViewH 10 -Count 60) -ne 1)  { throw "SelfTest: cursor below the window did not pull it down" }
+    if ((Get-Scroll -Cursor 3  -Scroll 9 -ViewH 10 -Count 60) -ne 3)  { throw "SelfTest: cursor above the window did not pull it up" }
+    if ((Get-Scroll -Cursor 59 -Scroll 0 -ViewH 10 -Count 60) -ne 50) { throw "SelfTest: last item not flush with the window bottom" }
+    if ((Get-Scroll -Cursor 0  -Scroll 0 -ViewH 10 -Count 4)  -ne 0)  { throw "SelfTest: a list shorter than the window scrolled" }
+    if ((Get-Scroll -Cursor 57 -Scroll 55 -ViewH 10 -Count 60) -ne 50) { throw "SelfTest: a scroll past the last full window was not pulled back" }
+
+    # Tab bar: "   Permission   " is 16 columns from 3, then two spaces; "[ Model ]" is 9 from 21.
+    $segs = @(Get-TabSegments -Names @("Permission", "Model", "Effort", "Extras") -Active 1)
+    if ($segs.Count -ne 4)                            { throw "SelfTest: tab bar lost a tab" }
+    if ($segs[0].Start -ne 3 -or $segs[0].End -ne 18) { throw "SelfTest: inactive tab spans the wrong columns" }
+    if ($segs[1].Start -ne 21 -or $segs[1].End -ne 29) { throw "SelfTest: the active tab's brackets are not counted" }
+    if ($segs[1].Text -ne "[ Model ]") { throw "SelfTest: the active tab lost its brackets" }
+    if ($segs[2].Start -ne 32)                        { throw "SelfTest: the two-space gap between tabs was dropped" }
+    $gap = $segs | Where-Object { 19 -ge $_.Start -and 19 -le $_.End }
+    if ($gap) { throw "SelfTest: a click in the gap between tabs hit tab $($gap.Index)" }
+    $on = $segs | Where-Object { 25 -ge $_.Start -and 25 -le $_.End }
+    if ($on.Index -ne 1) { throw "SelfTest: a click inside the active tab did not land on it" }
+    # Pipe the FUNCTION, not a variable: `return ,$segs` used to emit the array as one item, and
+    # only this shape saw it -- piping a variable unrolls one level and hid the bug.
+    $piped = Get-TabSegments -Names @("Permission", "Model", "Effort", "Extras") -Active 1 |
+             Where-Object { 25 -ge $_.Start -and 25 -le $_.End }
+    if ($piped.Index -ne 1) { throw "SelfTest: piping Get-TabSegments straight into Where-Object does not yield segments" }
+
     Write-Host "SelfTest OK"
     exit 0
 }
@@ -416,7 +628,7 @@ function Show-Menu {
     param([string[]]$MenuItems, [int]$Start = 0, [string]$EscLabel = "quit")
 
     $cursor = $Start
-    $hint = "   ${IN}[↑↓] move  [1-9] jump  [Enter] select  [Esc] $EscLabel$R$ESC[K"
+    $hint = "   ${IN}[↑↓] move  [1-9] jump  [Enter/click] select  [Esc] $EscLabel$R$ESC[K"
 
     # Render draws $MenuItems.Count + 2 lines down from $top. Scroll that space in now: in a
     # short window the buffer would otherwise scroll on the last line of every frame, leaving
@@ -443,16 +655,28 @@ function Show-Menu {
     }
 
     try {
+        Enable-MouseInput | Out-Null
         Render
 
         while ($true) {
-            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            $char = $key.Character
+            $ev = Read-Input
+            if ($ev.Kind -eq "click") {
+                $idx = $ev.Row - $top
+                if ($idx -ge 0 -and $idx -lt $MenuItems.Count) { return $idx }
+                continue
+            }
+            if ($ev.Kind -eq "wheel") {
+                if ($ev.Delta -gt 0) { if ($cursor -gt 0) { $cursor-- } }
+                else                 { if ($cursor -lt $MenuItems.Count - 1) { $cursor++ } }
+                Render
+                continue
+            }
+            $char = $ev.Char
             if ($char -ge '1' -and $char -le '9') {
                 $idx = [int]::Parse($char) - 1
                 if ($idx -lt $MenuItems.Count) { return $idx }
             }
-            switch ($key.VirtualKeyCode) {
+            switch ($ev.Vk) {
                 38 { if ($cursor -gt 0) { $cursor-- }; Render }
                 40 { if ($cursor -lt $MenuItems.Count - 1) { $cursor++ }; Render }
                 13 { return $cursor }
@@ -460,6 +684,7 @@ function Show-Menu {
             }
         }
     } finally {
+        Restore-ConsoleMode
         Write-Host "$ESC[?25h" -NoNewline
     }
 }
@@ -487,51 +712,93 @@ function Browse-Directory {
         Write-Host ""
         Write-Host "   $CL🔍$R ${B}Browse$R  ${IN}$current$R"
         Write-Host ""
-        Write-Host "   ${IN}[↑↓] move  [Enter] open  [Space] select here  [Esc] back$R"
+        Write-Host "   ${IN}[↑↓] move  [Enter/click] open  [Space] select here  [Esc] back$R"
         Write-Host ""
 
-        # Same reservation as Show-Menu: pre-scroll the rows Render-Tree redraws so $top stays valid.
-        $renderRows = $dirNames.Count
+        # The list is windowed. One row per child overflows the console on any sizeable
+        # directory: the buffer scrolls mid-render, $top goes stale, and the first entries --
+        # the ❯ cursor among them -- end up above the visible area. Height comes from where the
+        # header actually left the cursor, not from a constant, so a long path or hint that wraps
+        # to a second line shrinks the list instead of pushing its top off screen.
+        $viewH = [Math]::Max(3, [Console]::WindowHeight - ([Console]::CursorTop - [Console]::WindowTop) - 2)
+        $rows  = [Math]::Min($dirNames.Count, $viewH)
+        $renderRows = $rows + 1                     # +1: the position line under the list
         for ($i = 0; $i -lt $renderRows; $i++) { Write-Host "" }
         $top = [Math]::Max(0, [Console]::CursorTop - $renderRows)
         $cursor = 0
+        $scroll = 0
+        $winH   = [Console]::WindowHeight
 
         Write-Host "$ESC[?25l" -NoNewline
 
         function Render-Tree {
             [Console]::SetCursorPosition(0, $top)
-            for ($i = 0; $i -lt $dirNames.Count; $i++) {
+            # Iterate $i directly. A $r loop counter would silently overwrite $R, the ANSI reset --
+            # PowerShell variable names are case-insensitive.
+            for ($i = $scroll; $i -lt $scroll + $rows; $i++) {
                 if ($i -eq $cursor) {
                     Write-Host "   $BL$B❯ $($dirNames[$i])$R$ESC[K"
                 } else {
                     Write-Host "     $($dirNames[$i])$R$ESC[K"
                 }
             }
+            # Without this the windowing is invisible and a long directory just looks truncated.
+            if ($dirNames.Count -gt $rows) {
+                Write-Host "   ${IN}$($scroll + 1)-$($scroll + $rows) / $($dirNames.Count)$R$ESC[K"
+            } else {
+                Write-Host "$ESC[K"
+            }
         }
 
         try {
-            Render-Tree
+            Enable-MouseInput | Out-Null
 
             $selected = $null
             while ($null -eq $selected) {
-                $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-                switch ($key.VirtualKeyCode) {
-                    38 { if ($cursor -gt 0) { $cursor-- }; Render-Tree }
-                    40 { if ($cursor -lt $dirNames.Count - 1) { $cursor++ }; Render-Tree }
-                    13 {
-                        if ($dirs[$cursor] -eq "..") {
-                            $parent = Split-Path $current -Parent
-                            if ($parent) { $current = $parent }
-                        } else {
-                            $current = $dirs[$cursor]
-                        }
-                        $selected = "NAVIGATE"
+                # A resize invalidates $viewH, $rows and $top, all measured once above. Bail to the
+                # outer loop, which re-lists this same directory against the new size. Noticed on
+                # the next input event, since Read-Input is where this loop spends its time.
+                if ([Console]::WindowHeight -ne $winH) { $selected = "REDRAW"; continue }
+                # Clamp then draw at the top of every pass, so no branch below can leave the
+                # cursor out of view or forget to repaint.
+                $scroll = Get-Scroll -Cursor $cursor -Scroll $scroll -ViewH $rows -Count $dirNames.Count
+                Render-Tree
+
+                $open = $false
+                $ev = Read-Input
+                switch ($ev.Kind) {
+                    "click" {
+                        $i = $ev.Row - $top + $scroll
+                        if ($i -ge $scroll -and $i -lt $scroll + $rows) { $cursor = $i; $open = $true }
                     }
-                    32 { return $current }
-                    27 { return $null }
+                    "wheel" {
+                        $step = if ($ev.Delta -gt 0) { -3 } else { 3 }
+                        $scroll = [Math]::Max(0, [Math]::Min($dirNames.Count - $rows, $scroll + $step))
+                        if ($cursor -lt $scroll)         { $cursor = $scroll }
+                        if ($cursor -ge $scroll + $rows) { $cursor = $scroll + $rows - 1 }
+                    }
+                    "key" {
+                        switch ($ev.Vk) {
+                            38 { if ($cursor -gt 0) { $cursor-- } }
+                            40 { if ($cursor -lt $dirNames.Count - 1) { $cursor++ } }
+                            13 { $open = $true }
+                            32 { return $current }
+                            27 { return $null }
+                        }
+                    }
+                }
+                if ($open) {
+                    if ($dirs[$cursor] -eq "..") {
+                        $parent = Split-Path $current -Parent
+                        if ($parent) { $current = $parent }
+                    } else {
+                        $current = $dirs[$cursor]
+                    }
+                    $selected = "NAVIGATE"
                 }
             }
         } finally {
+            Restore-ConsoleMode
             Write-Host "$ESC[?25h" -NoNewline
         }
     }
@@ -716,6 +983,7 @@ function Show-TabbedConfig {
     )
 
     $activeTab = 0
+    $tabNames  = @($tabs | ForEach-Object { $_.name })
     $maxItems = ($tabs | ForEach-Object { if ($_.isMulti) { $extrasCatalog.Count } else { $_.items.Count } } | Measure-Object -Maximum).Maximum
     # Render draws $maxItems + 5 lines down from $tabBarTop. Scroll that space in now: in a
     # short window the buffer would otherwise scroll mid-render and every later frame would
@@ -723,6 +991,28 @@ function Show-TabbedConfig {
     $renderRows = $maxItems + 5
     for ($i = 0; $i -lt $renderRows; $i++) { Write-Host "" }
     $tabBarTop = [Math]::Max(0, [Console]::CursorTop - $renderRows)
+
+    # Shared by [Space] and by a click on the Extras tab, so the two can never drift apart.
+    function Toggle-Extra {
+        param($E)
+        if ($E.type -eq "color")           { Step-Color $E.kind }
+        elseif ($extrasSelected[$E.key])   { $extrasSelected.Remove($E.key) }
+        else                               { $extrasSelected[$E.key] = $true }
+    }
+
+    # Enter and a click both leave through here, so the two can never return different things.
+    function Get-Result {
+        return @{
+            permission = $tabs[0].modes[$tabs[0].cursor].key
+            model      = $tabs[1].modes[$tabs[1].cursor].key
+            effort     = $tabs[2].modes[$tabs[2].cursor].key
+            extras     = @($extrasSelected.Keys | Where-Object { $extrasSelected[$_] })
+            tabColor   = $colorPick["tab"]
+            bgColor    = $colorPick["bg"]
+            tabChoice  = Get-ColorChoice "tab"
+            bgChoice   = Get-ColorChoice "bg"
+        }
+    }
 
     function Get-VisibleLength {
         param([string]$Text)
@@ -781,9 +1071,9 @@ function Show-TabbedConfig {
     function Render {
         [Console]::SetCursorPosition(0, $tabBarTop)
         $bar = "   "
-        for ($i = 0; $i -lt $tabs.Count; $i++) {
-            if ($i -eq $activeTab) { $bar += "$BL$B[ $($tabs[$i].name) ]$R  " }
-            else                   { $bar += "$IN   $($tabs[$i].name)   $R  " }
+        foreach ($seg in (Get-TabSegments -Names $tabNames -Active $activeTab)) {
+            if ($seg.Index -eq $activeTab) { $bar += "$BL$B$($seg.Text)$R  " }
+            else                           { $bar += "$IN$($seg.Text)$R  " }
         }
         Write-Host "$bar$ESC[K"
         Write-Host "   ${IN}───────────────────────────────────────────$R$ESC[K"
@@ -827,59 +1117,65 @@ function Show-TabbedConfig {
         }
         Write-Host "$ESC[K"
         Write-Host "   $(Format-Selection)$ESC[K"
-        $pick = if ($tab.isMulti) { "[Space] toggle" } else { "[1-9] jump" }
-        Write-Host "   ${IN}[←→] tab  [↑↓] move  $pick  [Enter] launch  [Esc] back$R$ESC[K"
+        $pick = if ($tab.isMulti) { "[Space/click] toggle" } else { "[1-9] jump" }
+        # Click launches only on a single-select tab; an Extras row is a checkbox and its click
+        # toggles. Advertising both on the same footer is how a user ends up changing a setting
+        # while expecting a launch.
+        $go   = if ($tab.isMulti) { "[Enter] launch" } else { "[Enter/click] launch" }
+        Write-Host "   ${IN}[←→] tab  [↑↓] move  $pick  $go  [Esc] back$R$ESC[K"
     }
 
     Write-Host "$ESC[?25l" -NoNewline
     try {
+        Enable-MouseInput | Out-Null
         Render
         while ($true) {
-            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            $char = $key.Character
+            $ev = Read-Input
             $tab = $tabs[$activeTab]
+            $count = if ($tab.isMulti) { $extrasCatalog.Count } else { $tab.items.Count }
+            if ($ev.Kind -eq "click") {
+                if ($ev.Row -eq $tabBarTop) {
+                    $hit = Get-TabSegments -Names $tabNames -Active $activeTab |
+                           Where-Object { $ev.Col -ge $_.Start -and $ev.Col -le $_.End }
+                    if ($hit) { $activeTab = $hit.Index; Render }
+                    continue
+                }
+                # Item rows start two below the tab bar (bar + divider). A click is Enter, so on a
+                # single-select tab it picks and launches; on Extras the row is a checkbox and its
+                # Enter-equivalent is the toggle, or the boxes would be unreachable by mouse.
+                $idx = $ev.Row - $tabBarTop - 2
+                if ($idx -ge 0 -and $idx -lt $count) {
+                    $tab.cursor = $idx
+                    if (-not $tab.isMulti) { return Get-Result }
+                    Toggle-Extra $extrasCatalog[$idx]
+                    Render
+                }
+                continue
+            }
+            if ($ev.Kind -eq "wheel") {
+                if ($ev.Delta -gt 0) { if ($tab.cursor -gt 0)          { $tab.cursor-- } }
+                else                 { if ($tab.cursor -lt $count - 1) { $tab.cursor++ } }
+                Render
+                continue
+            }
+            $char = $ev.Char
             if ($char -ge '1' -and $char -le '9') {
-                $idx   = [int]::Parse($char) - 1
-                $count = if ($tab.isMulti) { $extrasCatalog.Count } else { $tab.items.Count }
+                $idx = [int]::Parse($char) - 1
                 if ($idx -lt $count) { $tab.cursor = $idx; Render }
                 continue
             }
-            switch ($key.VirtualKeyCode) {
+            switch ($ev.Vk) {
                 37 { if ($activeTab -gt 0)               { $activeTab-- }; Render }
                 39 { if ($activeTab -lt $tabs.Count - 1) { $activeTab++ }; Render }
                 38 { if ($tab.cursor -gt 0)              { $tab.cursor-- }; Render }
-                40 {
-                    $count = if ($tab.isMulti) { $extrasCatalog.Count } else { $tab.items.Count }
-                    if ($tab.cursor -lt $count - 1) { $tab.cursor++ }
-                    Render
-                }
-                32 {
-                    if ($tab.isMulti) {
-                        $e = $extrasCatalog[$tab.cursor]
-                        if ($e.type -eq "color") {
-                            Step-Color $e.kind
-                        } else {
-                            if ($extrasSelected[$e.key]) { $extrasSelected.Remove($e.key) } else { $extrasSelected[$e.key] = $true }
-                        }
-                        Render
-                    }
-                }
-                13 {
-                    return @{
-                        permission = $tabs[0].modes[$tabs[0].cursor].key
-                        model      = $tabs[1].modes[$tabs[1].cursor].key
-                        effort     = $tabs[2].modes[$tabs[2].cursor].key
-                        extras     = @($extrasSelected.Keys | Where-Object { $extrasSelected[$_] })
-                        tabColor   = $colorPick["tab"]
-                        bgColor    = $colorPick["bg"]
-                        tabChoice  = Get-ColorChoice "tab"
-                        bgChoice   = Get-ColorChoice "bg"
-                    }
-                }
+                40 { if ($tab.cursor -lt $count - 1) { $tab.cursor++ }; Render }
+                32 { if ($tab.isMulti) { Toggle-Extra $extrasCatalog[$tab.cursor]; Render } }
+                13 { return Get-Result }
                 27 { return $null }
             }
         }
     } finally {
+        Restore-ConsoleMode
         Write-Host "$ESC[?25h" -NoNewline
     }
 }

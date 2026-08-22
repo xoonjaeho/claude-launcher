@@ -109,12 +109,22 @@ Claude Code option.
 | `←` `→` | Switch tab |
 | `↑` `↓` | Move within a tab |
 | `1`-`9` | Jump to an item |
-| `Space` | Toggle (Extras tab only) |
+| `Space` | Toggle an extra — or cycle the Color option (Extras tab only) |
 | `Enter` | Launch with the current selection |
 | `Esc` | Back |
 
 Every single-select tab has an **inherit** option that leaves the corresponding
 `~/.claude/settings.json` value untouched (no flag is passed).
+
+The bottom line always shows what **every** tab currently holds, so launching never
+depends on tabbing back to check:
+
+```
+Permission bypassPermissions · Model Opus 5 · Effort ultracode · Extras IDE · Tab ● Blue · Background ● Green
+```
+
+Extras collapse to a count past two items, and if the window is too narrow for the field
+labels only the values are shown.
 
 ### Permission tab
 
@@ -162,9 +172,8 @@ ultracode would silently fall back to plain `xhigh`.
 
 ### Extras tab
 
-Multi-select (toggle with `Space`). Each enabled item appends its CLI flag. **Extras are
-session-only — the selection is not remembered between launches**, so the tab starts
-empty every time.
+Multi-select (toggle with `Space`). Each enabled item appends its CLI flag. The selection
+is remembered per directory, so the tab comes back the way it was left.
 
 | Extra | Flag | Purpose |
 |-------|------|---------|
@@ -178,13 +187,45 @@ empty every time.
 | **Cache** | `--exclude-dynamic-system-prompt-sections` | Move per-machine context to the first message for cache reuse |
 | **Brief** | `--brief` | Enable the SendUserMessage tool (agent-to-user messages mid-task) |
 | **Prompts** | `--prompt-suggestions` | Suggest a predicted next prompt each turn |
+| **Tab color** | — | Tab color, Windows Terminal only |
+| **Background** | — | Background tint |
+
+#### Tab color and Background
+
+Neither passes a flag — they color the terminal itself, independently, and `Space` cycles
+each one: `off → random → each palette color → off`.
+
+| Option | Sequence | Applies to |
+|--------|----------|------------|
+| **Tab color** | `OSC 4` on color-table slot 264 | Windows Terminal. Emitted unconditionally — a legacy console prints nothing for it, it just recolors that console's cursor |
+| **Background** | `OSC 11`, at 35% of the palette color | Any VT-capable console; kept dark or the text stops being readable |
+
+Both are emitted before Claude Code starts and stay in effect for the whole session.
+Setting either back to `off` emits a reset (`OSC 104;264` / `OSC 111`), so relaunching in a
+tab that already carries a color clears it instead of leaving the old one behind.
+
+> Do not gate the tab sequence on `WT_SESSION`. That variable is set only when Windows
+> Terminal starts the shell from one of its profiles. Started from a shortcut, the console
+> is still hosted by Windows Terminal and still has a tab, but the variable is empty.
+
+> In Windows Terminal the default theme derives the tab color from the terminal
+> background, so setting **Background** alone also tints the tab. Set **Tab color** to
+> override it.
+
+**A random pick never reuses a color a live session already holds.** Handed-out colors are
+recorded in `~/.claude/claude-launcher-colors.json` against the owning process (PID *and*
+start time, so a recycled PID cannot keep holding a color); entries whose process is gone
+are pruned on the next pick. Only sessions this launcher started are tracked — a tab opened
+by hand carries no custom color to clash with. If the whole palette is taken, one is reused.
 
 ### Saved choices
 
-Per-directory selections for **permission, model, and effort** are stored in
-`~/.claude/claude-launcher.json` and pre-selected the next time that directory is
-launched. **Extras are not saved** — the Extras tab always starts empty, so its flags
-apply only to the session being launched.
+Every tab's selection is stored per directory in `~/.claude/claude-launcher.json` and
+pre-selected the next time that directory is launched.
+
+Colors are saved as the *choice*, not the resolved color: a directory left on `random`
+rolls a fresh non-clashing color on every launch, while a directory pinned to `Teal` comes
+back Teal.
 
 ## Themes
 

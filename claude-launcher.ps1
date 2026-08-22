@@ -1,4 +1,4 @@
-﻿param([switch]$FromBat)
+﻿param([switch]$FromBat, [switch]$SelfTest)
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -92,6 +92,97 @@ $ModelColors = @{
     "opus"   = "$ESC[38;2;215;119;87m"    # Claude brand orange
     "sonnet" = "$ESC[38;2;122;162;247m"   # blue
     "haiku"  = "$ESC[38;2;125;207;255m"   # cyan
+}
+
+# --- Tab / background color (Extras > Color) ---
+# Windows Terminal takes the tab color from color-table slot 264 (OSC 4); a plain console
+# has no tab, so it gets a dark OSC 11 background tint instead. Both are in-band, so the
+# sequence is emitted from this console and survives into the launched session.
+$tabPalette = @(
+    @{ name = "Red";    rgb = "230;108;129" }
+    @{ name = "Orange"; rgb = "215;119;87"  }
+    @{ name = "Amber";  rgb = "255;193;7"   }
+    @{ name = "Green";  rgb = "78;186;101"  }
+    @{ name = "Teal";   rgb = "72;150;140"  }
+    @{ name = "Cyan";   rgb = "125;207;255" }
+    @{ name = "Blue";   rgb = "122;162;247" }
+    @{ name = "Indigo"; rgb = "177;185;249" }
+    @{ name = "Purple"; rgb = "175;135;255" }
+    @{ name = "Pink";   rgb = "236;72;153"  }
+)
+
+function Get-OscColor {
+    param([string]$Rgb, [double]$Scale = 1.0)
+    $p = $Rgb -split ';'
+    return ("rgb:{0:x2}/{1:x2}/{2:x2}" -f [int]([int]$p[0]*$Scale), [int]([int]$p[1]*$Scale), [int]([int]$p[2]*$Scale))
+}
+
+# Colors handed out to still-running sessions, so a random pick never clashes with an open tab.
+# Only tabs this launcher started are known — a hand-opened tab carries no custom color anyway.
+$colorStatePath = Join-Path $env:USERPROFILE ".claude\claude-launcher-colors.json"
+
+function Get-LiveTabColors {
+    # PID *and* process start time: a reused PID must not keep holding someone else's color.
+    $live = @{}
+    if (Test-Path $colorStatePath) {
+        try {
+            $obj = Get-Content $colorStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $obj.PSObject.Properties | ForEach-Object {
+                $prop = $_
+                try {
+                    $proc = Get-Process -Id ([int]$prop.Name) -ErrorAction SilentlyContinue
+                    if ($proc -and "$($proc.StartTime.Ticks)" -eq "$($prop.Value.start)") { $live[$prop.Name] = $prop.Value }
+                } catch {}
+            }
+        } catch {}
+    }
+    return $live
+}
+
+function Get-UsedTabColors {
+    $used = @()
+    (Get-LiveTabColors).Values | ForEach-Object { $used += @($_.colors) }
+    return @($used | Where-Object { $_ })
+}
+
+function Reserve-TabColor {
+    param([int]$OwnerPid, [string[]]$Names)
+    $live = Get-LiveTabColors
+    try {
+        $proc = Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue
+        if ($proc) { $live["$OwnerPid"] = @{ colors = @($Names); start = "$($proc.StartTime.Ticks)" } }
+        $live | ConvertTo-Json -Depth 4 | Set-Content -Path $colorStatePath -Encoding UTF8
+    } catch {}
+}
+
+function Select-TabColor {
+    param([string[]]$Used)
+    $free = @($tabPalette | Where-Object { $Used -notcontains $_.name })
+    # ponytail: palette exhausted → reuse one; a duplicate beats no color at all.
+    if ($free.Count -eq 0) { $free = $tabPalette }
+    return $free[(Get-Random -Maximum $free.Count)]
+}
+
+if ($SelfTest) {
+    $colorStatePath = Join-Path $env:TEMP "claude_launcher_colors_selftest.json"
+    Remove-Item $colorStatePath -ErrorAction SilentlyContinue
+    $me = Get-Process -Id $PID
+    @{ "$PID"   = @{ colors = @("Teal", "Amber"); start = "$($me.StartTime.Ticks)" }
+       "999999" = @{ colors = @("Red");           start = "0" } } | ConvertTo-Json -Depth 4 | Set-Content $colorStatePath -Encoding UTF8
+
+    $live = Get-LiveTabColors
+    if ($live.Count -ne 1) { throw "SelfTest: dead PID not pruned ($($live.Count) live)" }
+    # Both colors of a live session are held; the dead session's Red is released.
+    if ((Get-UsedTabColors) -join "," -ne "Teal,Amber") { throw "SelfTest: used-color list wrong ($((Get-UsedTabColors) -join ','))" }
+
+    1..200 | ForEach-Object {
+        if (@("Teal", "Amber") -contains (Select-TabColor -Used (Get-UsedTabColors)).name) { throw "SelfTest: picked a color already in use" }
+    }
+    if (-not (Select-TabColor -Used ($tabPalette | ForEach-Object { $_.name }))) { throw "SelfTest: exhausted palette returned nothing" }
+
+    Remove-Item $colorStatePath -ErrorAction SilentlyContinue
+    Write-Host "SelfTest OK"
+    exit 0
 }
 
 function Get-ModelTier {
@@ -425,6 +516,9 @@ $extrasCatalog = @(
     @{ key = "cache";    label = "Cache";    desc = "Move per-machine context to first message for cache reuse"; flag = "--exclude-dynamic-system-prompt-sections" }
     @{ key = "brief";    label = "Brief";    desc = "Enable SendUserMessage tool (agent-to-user messages mid-task)"; flag = "--brief" }
     @{ key = "prompts";  label = "Prompts";  desc = "Suggest a predicted next prompt each turn";              flag = "--prompt-suggestions" }
+    # Appearance — applied to the terminal itself, not passed to claude (hence no flag)
+    @{ key = "tabcolor"; label = "Tab color"; desc = "Tab color (Windows Terminal only)";                    type = "color"; kind = "tab" }
+    @{ key = "bgcolor";  label = "Background"; desc = "Background tint";                                     type = "color"; kind = "bg"  }
 )
 
 $permDefaultIndex = 0
@@ -466,22 +560,27 @@ function Get-PathChoices {
     $state = Get-LauncherState
     if (-not $state.perPath.ContainsKey($Path)) { return $null }
     $entry = $state.perPath[$Path]
-    $choices = @{ permission = $null; model = $null; effort = $null }
+    $choices = @{ permission = $null; model = $null; effort = $null; extras = @(); tabColor = $null; bgColor = $null }
     if ($entry -is [string]) {
         $choices.permission = $entry
     } elseif ($entry) {
         $choices.permission = $entry.permission
         $choices.model      = $entry.model
         $choices.effort     = $entry.effort
+        $choices.tabColor   = $entry.tabColor
+        $choices.bgColor    = $entry.bgColor
+        if ($entry.extras) { $choices.extras = @($entry.extras) }
     }
     return $choices
 }
 
 function Save-PathChoices {
-    param([string]$Path, $Permission, $Model, $Effort)
+    param([string]$Path, $Permission, $Model, $Effort, $Extras, $TabColor, $BgColor)
     $state = Get-LauncherState
-    # ponytail: extras intentionally not persisted (session-only) — always store empty.
-    $state.perPath[$Path] = @{ permission = $Permission; model = $Model; effort = $Effort; extras = @() }
+    # Colors are stored as the *choice* ("random" or a palette name), not the resolved color,
+    # so a saved "random" rolls a fresh non-clashing color on every launch.
+    $state.perPath[$Path] = @{ permission = $Permission; model = $Model; effort = $Effort
+                               extras = @($Extras); tabColor = $TabColor; bgColor = $BgColor }
     $dir = Split-Path $launcherStatePath -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $state | ConvertTo-Json -Depth 5 | Set-Content -Path $launcherStatePath -Encoding UTF8
@@ -514,8 +613,28 @@ function Show-TabbedConfig {
         $effortStart = $effortDefaultIndex
     }
 
-    # ponytail: extras are session-only — never seeded from saved state, so the tab starts fresh each launch.
+    # Colors are terminal settings, not CLI flags, so they stay out of $extrasSelected — the launch
+    # loop looks up a flag per selected extra and would find none. -1 off, 0 random, 1..N palette.
     $extrasSelected = @{}
+    $colorIdx  = @{ tab = -1;    bg = -1    }
+    $colorPick = @{ tab = $null; bg = $null }
+
+    if ($null -ne $choices) {
+        foreach ($k in $choices.extras) {
+            if ($k -and ($extrasCatalog | Where-Object { $_.key -eq $k -and -not $_.type })) { $extrasSelected[$k] = $true }
+        }
+        foreach ($kind in @("tab", "bg")) {
+            $saved = if ($kind -eq "tab") { $choices.tabColor } else { $choices.bgColor }
+            if ($saved -eq "random") {
+                $colorIdx[$kind]  = 0
+                $colorPick[$kind] = Select-TabColor -Used (Get-UsedTabColors)
+            } elseif ($saved) {
+                for ($i = 0; $i -lt $tabPalette.Count; $i++) {
+                    if ($tabPalette[$i].name -eq $saved) { $colorIdx[$kind] = $i + 1; $colorPick[$kind] = $tabPalette[$i] }
+                }
+            }
+        }
+    }
 
     $tabs = @(
         @{ name = "Permission"; items = $permItems;   modes = $permModes;    cursor = $permStart;   isMulti = $false }
@@ -526,7 +645,66 @@ function Show-TabbedConfig {
 
     $activeTab = 0
     $maxItems = ($tabs | ForEach-Object { if ($_.isMulti) { $extrasCatalog.Count } else { $_.items.Count } } | Measure-Object -Maximum).Maximum
-    $tabBarTop = [Console]::CursorTop
+    # Render draws $maxItems + 5 lines down from $tabBarTop. Scroll that space in now: in a
+    # short window the buffer would otherwise scroll mid-render and every later frame would
+    # draw from a stale $tabBarTop, stranding rows of the previous tab on screen.
+    $renderRows = $maxItems + 5
+    for ($i = 0; $i -lt $renderRows; $i++) { Write-Host "" }
+    $tabBarTop = [Math]::Max(0, [Console]::CursorTop - $renderRows)
+
+    function Get-VisibleLength {
+        param([string]$Text)
+        return ($Text -replace "$ESC\[[0-9;]*m", '').Length
+    }
+
+    function Format-ColorValue {
+        param([string]$Kind)
+        if ($colorIdx[$Kind] -lt 0) { return "${IN}off$R" }
+        $sw = "$ESC[38;2;$($colorPick[$Kind].rgb)m"
+        if ($colorIdx[$Kind] -eq 0) { return "$sw random ($($colorPick[$Kind].name))$R" }
+        return "$sw$($colorPick[$Kind].name)$R"
+    }
+
+    # off → random → each palette color → off
+    function Step-Color {
+        param([string]$Kind)
+        $colorIdx[$Kind]++
+        if ($colorIdx[$Kind] -gt $tabPalette.Count) { $colorIdx[$Kind] = -1 }
+        if ($colorIdx[$Kind] -eq 0)     { $colorPick[$Kind] = Select-TabColor -Used (Get-UsedTabColors) }
+        elseif ($colorIdx[$Kind] -gt 0) { $colorPick[$Kind] = $tabPalette[$colorIdx[$Kind] - 1] }
+        else                            { $colorPick[$Kind] = $null }
+    }
+
+    # What gets saved: the choice, not the rolled color.
+    function Get-ColorChoice {
+        param([string]$Kind)
+        if ($colorIdx[$Kind] -lt 0) { return $null }
+        if ($colorIdx[$Kind] -eq 0) { return "random" }
+        return $colorPick[$Kind].name
+    }
+
+    # Bottom line: what every tab currently holds, so a launch never depends on tabbing back.
+    function Format-Selection {
+        $vals = @()
+        foreach ($i in 0..2) {
+            $m = $tabs[$i].modes[$tabs[$i].cursor]
+            $vals += "$($m.color)$($m.label)$R"
+        }
+        $on = @($extrasCatalog | Where-Object { $extrasSelected[$_.key] })
+        if     ($on.Count -eq 0) { $vals += "${IN}none$R" }
+        elseif ($on.Count -le 2) { $vals += "$GN$(($on | ForEach-Object { $_.label }) -join ', ')$R" }
+        else                     { $vals += "$GN$($on.Count) selected$R" }
+        foreach ($kind in @("tab", "bg")) {
+            if ($colorIdx[$kind] -lt 0) { $vals += "${IN}off$R" }
+            else                        { $vals += "$ESC[38;2;$($colorPick[$kind].rgb)m●$R $($colorPick[$kind].name)" }
+        }
+
+        $names = @("Permission", "Model", "Effort", "Extras", "Tab", "Background")
+        $long  = (0..5 | ForEach-Object { "${IN}$($names[$_])$R $($vals[$_])" }) -join " ${IN}·$R "
+        if ((Get-VisibleLength $long) -le [Console]::WindowWidth - 4) { return $long }
+        # Too narrow for labels — the tab bar above already gives the order.
+        return ($vals -join " ${IN}·$R ")
+    }
 
     function Render {
         [Console]::SetCursorPosition(0, $tabBarTop)
@@ -542,9 +720,15 @@ function Show-TabbedConfig {
         if ($tab.isMulti) {
             for ($i = 0; $i -lt $maxItems; $i++) {
                 if ($i -lt $extrasCatalog.Count) {
-                    $e   = $extrasCatalog[$i]
-                    $chk = if ($extrasSelected[$e.key]) { "$GN[x]$R" } else { "${IN}[ ]$R" }
-                    $line = "$chk $WH$($e.label)$R  ${IN}— $($e.desc)$R"
+                    $e = $extrasCatalog[$i]
+                    if ($e.type -eq "color") {
+                        $pick = $colorPick[$e.kind]
+                        $chk  = if ($pick) { "$ESC[38;2;$($pick.rgb)m[●]$R" } else { "${IN}[ ]$R" }
+                        $line = "$chk $WH$($e.label)$R  ${IN}— $($e.desc):$R $(Format-ColorValue $e.kind)"
+                    } else {
+                        $chk  = if ($extrasSelected[$e.key]) { "$GN[x]$R" } else { "${IN}[ ]$R" }
+                        $line = "$chk $WH$($e.label)$R  ${IN}— $($e.desc)$R"
+                    }
                     $num = $i + 1
                     if ($i -eq $tab.cursor) {
                         Write-Host "   $BL$B❯$R $num. $line$ESC[K"
@@ -555,8 +739,6 @@ function Show-TabbedConfig {
                     Write-Host "$ESC[K"
                 }
             }
-            Write-Host "$ESC[K"
-            Write-Host "   ${IN}[←→] tab  [↑↓] move  [Space] toggle  [Enter] launch  [Esc] back$R$ESC[K"
         } else {
             for ($i = 0; $i -lt $maxItems; $i++) {
                 if ($i -lt $tab.items.Count) {
@@ -570,9 +752,11 @@ function Show-TabbedConfig {
                     Write-Host "$ESC[K"
                 }
             }
-            Write-Host "$ESC[K"
-            Write-Host "   ${IN}[←→] tab  [↑↓] move  [1-9] jump  [Enter] launch  [Esc] back$R$ESC[K"
         }
+        Write-Host "$ESC[K"
+        Write-Host "   $(Format-Selection)$ESC[K"
+        $pick = if ($tab.isMulti) { "[Space] toggle" } else { "[1-9] jump" }
+        Write-Host "   ${IN}[←→] tab  [↑↓] move  $pick  [Enter] launch  [Esc] back$R$ESC[K"
     }
 
     Write-Host "$ESC[?25l" -NoNewline
@@ -599,8 +783,12 @@ function Show-TabbedConfig {
                 }
                 32 {
                     if ($tab.isMulti) {
-                        $ekey = $extrasCatalog[$tab.cursor].key
-                        if ($extrasSelected[$ekey]) { $extrasSelected.Remove($ekey) } else { $extrasSelected[$ekey] = $true }
+                        $e = $extrasCatalog[$tab.cursor]
+                        if ($e.type -eq "color") {
+                            Step-Color $e.kind
+                        } else {
+                            if ($extrasSelected[$e.key]) { $extrasSelected.Remove($e.key) } else { $extrasSelected[$e.key] = $true }
+                        }
                         Render
                     }
                 }
@@ -610,6 +798,10 @@ function Show-TabbedConfig {
                         model      = $tabs[1].modes[$tabs[1].cursor].key
                         effort     = $tabs[2].modes[$tabs[2].cursor].key
                         extras     = @($extrasSelected.Keys | Where-Object { $extrasSelected[$_] })
+                        tabColor   = $colorPick["tab"]
+                        bgColor    = $colorPick["bg"]
+                        tabChoice  = Get-ColorChoice "tab"
+                        bgChoice   = Get-ColorChoice "bg"
                     }
                 }
                 27 { return $null }
@@ -625,6 +817,10 @@ $selectedPermission = $null
 $selectedModel = $null
 $selectedEffort = $null
 $selectedExtras = @()
+$selectedTabColor = $null
+$selectedBgColor  = $null
+$selectedTabChoice = $null
+$selectedBgChoice  = $null
 
 if ($isLocal) {
     $menu = Build-LocalMenu -BaseDir $currentDir
@@ -649,6 +845,10 @@ if ($isLocal) {
         $selectedModel      = $cfg.model
         $selectedEffort     = $cfg.effort
         $selectedExtras     = $cfg.extras
+        $selectedTabColor   = $cfg.tabColor
+        $selectedBgColor    = $cfg.bgColor
+        $selectedTabChoice  = $cfg.tabChoice
+        $selectedBgChoice   = $cfg.bgChoice
         break
     }
 } else {
@@ -694,8 +894,7 @@ if ($isLocal) {
             $subTarget = $subMenu.paths[$subChoice]
             if ($subTarget -eq "__BROWSE__") {
                 $browsed = Browse-Directory -StartPath $target
-                if ($null -ne $browsed) { $pickedPath = $browsed }
-                continue
+                if ($null -ne $browsed) { $subTarget = $browsed } else { continue }
             }
 
             $cfg = Show-TabbedConfig -Path $subTarget
@@ -707,13 +906,18 @@ if ($isLocal) {
             $selectedModel      = $cfg.model
             $selectedEffort     = $cfg.effort
             $selectedExtras     = $cfg.extras
+            $selectedTabColor   = $cfg.tabColor
+            $selectedBgColor    = $cfg.bgColor
+            $selectedTabChoice  = $cfg.tabChoice
+            $selectedBgChoice   = $cfg.bgChoice
         }
 
         if ($null -ne $selectedPath) { break }
     }
 }
 
-Save-PathChoices -Path $selectedPath -Permission $selectedPermission -Model $selectedModel -Effort $selectedEffort
+Save-PathChoices -Path $selectedPath -Permission $selectedPermission -Model $selectedModel -Effort $selectedEffort `
+                 -Extras $selectedExtras -TabColor $selectedTabChoice -BgColor $selectedBgChoice
 
 # ultracode needs an xhigh-capable (Opus or Fable) model. Resolve the effective model and force Opus if needed.
 # Runs after Save-PathChoices so the user's real model choice is preserved in per-path state.
@@ -722,7 +926,7 @@ $ultraForcedFrom = $null
 if ($selectedEffort -eq "ultracode") {
     $effModel = if ($selectedModel) { $selectedModel } else { $settingsModel }
     # opusplan runs Sonnet outside plan mode, so it is NOT xhigh-capable despite the "opus" substring.
-    # Fable 5 supports xhigh (same effort range as Opus 4.8), so it counts as capable too.
+    # Fable 5 supports xhigh (same effort range as Opus 5), so it counts as capable too.
     $effTier = Get-ModelTier $effModel
     $isXhighCapable = ($effModel -notlike "opusplan*") -and ($effTier -eq "opus" -or $effTier -eq "fable")
     if (-not $isXhighCapable) {
@@ -758,6 +962,31 @@ foreach ($ekey in $selectedExtras) {
 # statusline reads EFFORT_LEVEL; pass the selected level through verbatim so an ultracode
 # launch renders as "ultracode" (statusline handles it as a known key now).
 $effortEnv = $selectedEffort
+
+# --- Terminal colors (Extras > Tab color / Background) ---
+# Emitted from this console, so they are already in effect when claude takes over the same tab.
+# Tab color is Windows Terminal only (color-table slot 264); the background tint is kept dark,
+# or the text stops being readable.
+# Unconditional: with both colors off this records an empty list, which RELEASES the colors
+# this owner held. Skipping the call instead would leave a live PID reserving a color it no
+# longer shows, blocking it for every other session.
+$ownerPid = $PID
+if ($FromBat) {
+    # The launch .bat runs in the parent cmd.exe, which is what outlives this script.
+    $parent = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue).ParentProcessId
+    if ($parent) { $ownerPid = [int]$parent }
+}
+Reserve-TabColor -OwnerPid $ownerPid -Names @($selectedTabColor.name, $selectedBgColor.name | Where-Object { $_ })
+# No $env:WT_SESSION guard: it is set only when Windows Terminal starts the shell from a
+# profile. Launched from the .lnk, the console is still hosted by Windows Terminal (default
+# terminal app) and has a tab, but the variable is empty -- the guard silently dropped every
+# shortcut launch. Measured in a legacy conhost: the sequence prints nothing, it just recolors
+# that console's cursor. Harmless, so emit unconditionally rather than guess at the host.
+# "off" resets rather than skipping, or relaunching in the same tab keeps the previous color.
+if ($selectedTabColor) { [Console]::Write("$ESC]4;264;$(Get-OscColor $selectedTabColor.rgb)$ESC\") }
+else                   { [Console]::Write("$ESC]104;264$ESC\") }
+if ($selectedBgColor)  { [Console]::Write("$ESC]11;$(Get-OscColor $selectedBgColor.rgb 0.35)$ESC\") }
+else                   { [Console]::Write("$ESC]111$ESC\") }
 
 if ($FromBat) {
     $safePath = $selectedPath -replace '%','%%'

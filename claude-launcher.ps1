@@ -93,6 +93,25 @@ $ModelColors = @{
     "sonnet" = "$ESC[38;2;122;162;247m"   # blue
     "haiku"  = "$ESC[38;2;125;207;255m"   # cyan
 }
+# Menu order, and the only families the launcher colors. Get-ModelCatalog resolves each one
+# to the model that family's alias currently launches, as the installed Claude Code defines it.
+$ModelTiers = @("fable", "opus", "sonnet", "haiku")
+
+# A family alias resolves to a different model per backend, so the label has to follow the same
+# table the CLI does. Each CLAUDE_CODE_USE_<X> maps to the catalog per_provider key <x>.
+$ModelProviders = @("BEDROCK", "VERTEX", "FOUNDRY", "MANTLE", "GATEWAY", "ANTHROPIC_AWS", "ANTHROPIC_GOOGLE_CLOUD")
+
+# The ids the Model menu offered before it switched to family aliases. Each one meant "newest of
+# this family" when it was saved, so folding it onto the alias preserves the choice. Anything
+# else an older launcher wrote -- a pinned older model, or a [1m] context variant -- means
+# something this menu cannot express, and is left to miss and fall back to inherit rather than
+# silently become the newest model of its family.
+$LegacyModelIds = @{
+    "claude-fable-5"            = "fable"
+    "claude-opus-5"             = "opus"
+    "claude-sonnet-5"           = "sonnet"
+    "claude-haiku-4-5-20251001" = "haiku"
+}
 
 # --- Tab / background color (Extras > Color) ---
 # Windows Terminal takes the tab color from color-table slot 264 (OSC 4); a plain console
@@ -329,6 +348,41 @@ function Get-Scroll {
     return $Scroll
 }
 
+# Claude Code carries its model catalog inside the binary: {id,family,display_name} records, plus
+# an `aliases` table saying what each family alias resolves to on each backend. Reading it there
+# is what keeps this launcher off a hand-maintained list that goes stale on every model release.
+# `aliases` is the source and `latest_per_family` is not: on Bedrock, `--model sonnet` launches
+# Sonnet 4.5 while latest_per_family still says Sonnet 5, so the menu would label the row wrong.
+# Families resolve independently -- one family the binary describes oddly costs that row its
+# version number, never the other three. $null means nothing parsed at all.
+function Parse-ModelCatalog {
+    param([string]$Text, [string]$Provider)
+    $names = @{}
+    $families = @{}
+    foreach ($m in [regex]::Matches($Text, '\{id:"(?<id>claude-[a-z0-9-]+)",family:"(?<fam>[a-z]+)",display_name:"(?<name>[^"]+)"')) {
+        $id = $m.Groups["id"].Value
+        $names[$id]    = $m.Groups["name"].Value
+        $families[$id] = $m.Groups["fam"].Value
+    }
+    # Bounded lazy match: the empty `aliases:{}` schema default cannot start with a family entry so
+    # the engine walks past it, and the cap stops a missing terminator from dragging over 200 MB.
+    $block = [regex]::Match($Text, 'aliases:\{(?<b>[a-z]+:\{default:"claude-.{0,4000}?)\},defaults:')
+    $latest = @{}
+    foreach ($m in [regex]::Matches($block.Groups["b"].Value, '(?<fam>[a-z]+):\{default:"(?<def>[^"]+)"(?:,per_provider:\{(?<pp>[^{}]*)\})?\}')) {
+        $fam = $m.Groups["fam"].Value
+        $id  = $m.Groups["def"].Value
+        if ($Provider) {
+            $hit = [regex]::Match($m.Groups["pp"].Value, '(?:^|,)' + [regex]::Escape($Provider) + ':"(?<v>[^"]+)"')
+            if ($hit.Success) { $id = $hit.Groups["v"].Value }
+        }
+        # A record whose own family contradicts the alias key would put "Opus 5" on the Fable row.
+        # An id with no record at all fails the same test, since both maps are filled together.
+        if ($families[$id] -eq $fam) { $latest[$fam] = $id }
+    }
+    if ($latest.Count -eq 0) { return $null }
+    return @{ latest = $latest; names = $names }
+}
+
 if ($SelfTest) {
     $colorStatePath = Join-Path $env:TEMP "claude_launcher_colors_selftest.json"
     Remove-Item $colorStatePath -ErrorAction SilentlyContinue
@@ -456,6 +510,36 @@ if ($SelfTest) {
              Where-Object { 25 -ge $_.Start -and 25 -le $_.End }
     if ($piped.Index -ne 1) { throw "SelfTest: piping Get-TabSegments straight into Where-Object does not yield segments" }
 
+    if (($ModelTiers -join ",") -ne "fable,opus,sonnet,haiku") { throw "SelfTest: the tier list changed; menu order, colors and the parser all read it" }
+
+    # Shaped like the real binary. Keeping a fixture here is the only way to test the catalog
+    # regexes without reading 200 MB; it catches a regex regression, not the binary drifting.
+    # Every assertion below is written `-not $cat -or ...`: on a $null catalog the indexing alone
+    # raises a NullArray error that PS 5.1 does not treat as terminating, so the `if` would be
+    # abandoned and the run would reach "SelfTest OK" having tested nothing.
+    $catFixture = 'aliases:{opus:{default:"claude-opus-5",per_provider:{bedrock:"claude-opus-4-6"}},fable:{default:"claude-fable-5-1"},sonnet:{default:"claude-sonnet-5"},haiku:{default:"claude-haiku-4-5"},mythos:{default:"claude-mythos-5"}},defaults:{},{id:"claude-opus-5",family:"opus",display_name:"Opus 5",cost:1},{id:"claude-opus-4-6",family:"opus",display_name:"Opus 4.6"},{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"},{id:"claude-sonnet-5",family:"sonnet",display_name:"Sonnet 5"},{id:"claude-haiku-4-5",family:"haiku",display_name:"Haiku 4.5"},{id:"claude-mythos-5",family:"mythos",display_name:""}'
+    $cat = Parse-ModelCatalog $catFixture ""
+    if (-not $cat) { throw "SelfTest: the model catalog did not parse at all" }
+    # mythos is in the fixture with an empty display name: an unlabelled family must not reach a row.
+    if ((($cat.latest.Keys | Sort-Object) -join ",") -ne "fable,haiku,opus,sonnet") { throw "SelfTest: the catalog gained or lost a family" }
+    if ($cat.names[$cat.latest["fable"]] -ne "Fable 5.1") { throw "SelfTest: the catalog did not resolve the newest Fable" }
+    if ($cat.names[$cat.latest["haiku"]] -ne "Haiku 4.5") { throw "SelfTest: the catalog lost Haiku's label" }
+
+    # The backend decides what an alias launches, so the label has to move with it.
+    $catB = Parse-ModelCatalog $catFixture "bedrock"
+    if (-not $catB -or $catB.names[$catB.latest["opus"]] -ne "Opus 4.6") { throw "SelfTest: a per-provider alias override was ignored" }
+    if (-not $catB -or $catB.names[$catB.latest["sonnet"]] -ne "Sonnet 5") { throw "SelfTest: a family with no override for this provider lost its default" }
+
+    $catX = Parse-ModelCatalog ($catFixture -replace '\{id:"claude-fable-5-1",family:"fable"', '{id:"claude-fable-5-1",family:"opus"') ""
+    if (-not $catX -or $catX.latest["fable"]) { throw "SelfTest: a catalog entry whose family contradicts the alias key was accepted" }
+
+    # One family the binary describes oddly must cost that row its version, not all four.
+    $catP = Parse-ModelCatalog ($catFixture -replace ',\{id:"claude-haiku-4-5"[^}]*\}', '') ""
+    if (-not $catP -or $catP.latest["haiku"]) { throw "SelfTest: a family with no display name was kept" }
+    if (-not $catP -or $catP.names[$catP.latest["opus"]] -ne "Opus 5") { throw "SelfTest: one unusable family took the others down with it" }
+
+    if (Parse-ModelCatalog ($catFixture -replace 'aliases:\{', 'aliases:{}x') "") { throw "SelfTest: a catalog with no alias table must return nothing" }
+
     Write-Host "SelfTest OK"
     exit 0
 }
@@ -463,7 +547,7 @@ if ($SelfTest) {
 function Get-ModelTier {
     param([string]$id)
     $lower = "$id".ToLower()
-    foreach ($tier in @("fable","opus","sonnet","haiku")) {
+    foreach ($tier in $ModelTiers) {
         if ($lower.Contains($tier)) { return $tier }
     }
     return ""
@@ -474,6 +558,63 @@ function Get-EffortKey {
     $lower = "$effort".ToLower()
     if ($EffortColors.ContainsKey($lower)) { return $lower }
     return ""
+}
+
+# Which backend the launched session will use. The launcher hands `claude` its own environment,
+# so reading these here is reading what that session will see.
+function Get-ModelProvider {
+    foreach ($v in $ModelProviders) {
+        $val = [Environment]::GetEnvironmentVariable("CLAUDE_CODE_USE_$v")
+        if ($val -and $val -ne "0" -and $val -ne "false") { return $v.ToLower() }
+    }
+    return ""
+}
+
+# Scanning 200 MB costs ~500 ms and a transient copy of the whole binary, so it happens once per
+# Claude Code build. The key mixes the version the CLI reports with the file identity, because
+# neither alone is enough: a version string does not name the file it was read from, and an
+# upgrade delivered with its timestamp preserved can land on the same length and mtime. A failed
+# parse is cached under the same key -- otherwise a binary this launcher cannot read would pay the
+# full scan on every single launch, forever.
+function Get-ModelCatalog {
+    param([string]$Version)
+    $exe = try { (Get-Command claude -ErrorAction Stop).Source } catch { $null }
+    if (-not $exe) { return $null }
+    # An npm install puts a shim on PATH; the catalog is in the JS bundle behind it.
+    if ($exe -match "\.(cmd|bat|ps1)$") {
+        $cli = Join-Path (Split-Path $exe -Parent) "node_modules\@anthropic-ai\claude-code\cli.js"
+        if (Test-Path -LiteralPath $cli) { $exe = $cli }
+    }
+    $f = try { Get-Item -LiteralPath $exe -ErrorAction Stop } catch { $null }
+    if (-not $f) { return $null }
+    $provider = Get-ModelProvider
+    $stamp = "$Version-$($f.Length)-$($f.LastWriteTimeUtc.Ticks)-$provider"
+    $cachePath = Join-Path $env:USERPROFILE ".claude\claude-launcher-models.json"
+    try {
+        $c = Get-Content $cachePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+        if ($c.stamp -eq $stamp) {
+            if ($c.failed) { return $null }
+            $cached = @{ latest = @{}; names = @{} }
+            $c.latest.PSObject.Properties | ForEach-Object { $cached.latest[$_.Name] = $_.Value }
+            $c.names.PSObject.Properties  | ForEach-Object { $cached.names[$_.Name]  = $_.Value }
+            # The same invariant Parse-ModelCatalog enforces, so a hand-edited cache gets no
+            # further than a freshly parsed one.
+            $ok = $cached.latest.Count -gt 0
+            foreach ($fam in @($cached.latest.Keys)) { if (-not $cached.names[$cached.latest[$fam]]) { $ok = $false } }
+            if ($ok) { return $cached }
+        }
+    } catch {}
+    Write-Host "Reading the model catalog from $(Split-Path $exe -Leaf)..."
+    # 28591 is Latin-1: [Text.Encoding]::Latin1 does not exist on the PS 5.1 the .bat starts.
+    $cat = try { Parse-ModelCatalog ([Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))) $provider } catch { $null }
+    $entry = if ($cat) { @{ stamp = $stamp; latest = $cat.latest; names = $cat.names } } else { @{ stamp = $stamp; failed = $true } }
+    # Publish by rename: two launchers cold-starting together must never read a half-written file.
+    $tmpPath = "$cachePath.$PID.tmp"
+    try {
+        $entry | ConvertTo-Json -Depth 3 | Set-Content -Path $tmpPath -Encoding UTF8
+        Move-Item -LiteralPath $tmpPath -Destination $cachePath -Force
+    } catch { Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue }
+    return $cat
 }
 
 $basedir = (Get-Location).Path
@@ -522,26 +663,43 @@ try {
         if ($s.permissionMode) { $settingsPermission = $s.permissionMode }
     }
 } catch {}
-if (-not $modelDisplay) {
-    $defaultModels = @{ "max"="claude-opus-5"; "pro"="claude-sonnet-5"; "team"="claude-sonnet-5"; "enterprise"="claude-sonnet-5" }
-    if ($sub -and $defaultModels.ContainsKey($sub)) { $modelDisplay = $defaultModels[$sub] }
+# --- Model catalog (read from the installed Claude Code; single source of truth for header + tab menu) ---
+# The menu key is the family alias, not the id: `claude --model fable` resolves to the newest Fable
+# on its own, so a per-path choice saved today still means "newest Fable" after the next release.
+# Only the label needs the version, which is why a failed scan degrades to "Fable" and still launches.
+$claudeModels = Get-ModelCatalog $cver
+$modelNames   = if ($claudeModels) { $claudeModels.names } else { @{} }
+$modelCatalog = @(foreach ($tier in $ModelTiers) {
+    $id = if ($claudeModels) { $claudeModels.latest[$tier] } else { $null }
+    $name = if ($id -and $modelNames[$id]) { $modelNames[$id] } else { [char]::ToUpper($tier[0]) + $tier.Substring(1) }
+    @{ id = $tier; name = $name; tier = $tier }
+})
+
+# settings.json can hold a full id, a family alias, or something this catalog has never heard of.
+# Prefer the catalog name, then the menu row, then the bare family, so a failed scan shows "Opus"
+# instead of a raw id. opusplan is handed back untouched: it contains "opus" but runs Sonnet.
+function Format-ModelLabel {
+    param([string]$Value)
+    if (-not $Value -or $Value -like "opusplan*") { return $Value }
+    if ($modelNames.ContainsKey($Value)) { return $modelNames[$Value] }
+    $row = $modelCatalog | Where-Object { $_.id -eq $Value }
+    if ($row) { return $row.name }
+    $tier = Get-ModelTier $Value
+    if ($tier) { return [char]::ToUpper($tier[0]) + $tier.Substring(1) }
+    return $Value
 }
 
-# --- Model catalog (single source of truth for header + tab menu) ---
-$modelCatalog = @(
-    @{ id = "claude-fable-5";            name = "Fable 5";   tier = "fable" }
-    @{ id = "claude-opus-5";             name = "Opus 5";    tier = "opus" }
-    @{ id = "claude-sonnet-5";           name = "Sonnet 5";  tier = "sonnet" }
-    @{ id = "claude-haiku-4-5-20251001"; name = "Haiku 4.5"; tier = "haiku" }
-)
-$modelNames = @{}
-foreach ($m in $modelCatalog) { $modelNames[$m.id] = $m.name }
-if ($modelDisplay -and $modelNames.ContainsKey($modelDisplay)) {
-    $modelDisplay = $modelNames[$modelDisplay]
+if (-not $modelDisplay) {
+    $defaultTiers = @{ "max"="opus"; "pro"="sonnet"; "team"="sonnet"; "enterprise"="sonnet" }
+    if ($sub -and $defaultTiers.ContainsKey($sub)) {
+        $modelDisplay = ($modelCatalog | Where-Object { $_.tier -eq $defaultTiers[$sub] }).name
+    }
+} else {
+    $modelDisplay = Format-ModelLabel $modelDisplay
 }
 
 $permInheritDesc  = "Claude Code default"
-$modelInheritVal  = if ($settingsModel -and $modelNames.ContainsKey($settingsModel)) { $modelNames[$settingsModel] } elseif ($settingsModel) { $settingsModel } else { "" }
+$modelInheritVal  = Format-ModelLabel $settingsModel
 $modelInheritDesc = if ($modelInheritVal)    { "$modelInheritVal (Use settings.json value)" }    else { "Use settings.json value" }
 $effortInheritDesc = if ($settingsEffort)    { "$settingsEffort (Use settings.json value)" }      else { "Use settings.json value" }
 
@@ -831,8 +989,8 @@ $efforts = @(
     @{ key="auto";   label="auto";    desc="Adaptive — Claude picks effort per turn";            color=$EffortColors["auto"]   }
     @{ key="low";    label="low";     desc="Short, scoped, latency-sensitive tasks";             color=$EffortColors["low"]    }
     @{ key="medium"; label="medium";  desc="Reduced token usage for cost-sensitive work";        color=$EffortColors["medium"] }
-    @{ key="high";   label="high";    desc="Default for Opus 5 — balanced intelligence";         color=$EffortColors["high"]   }
-    @{ key="xhigh";  label="xhigh";   desc="For the hardest tasks (Opus 5 recommended)";         color=$EffortColors["xhigh"]  }
+    @{ key="high";   label="high";    desc="Default for Opus — balanced intelligence";           color=$EffortColors["high"]   }
+    @{ key="xhigh";  label="xhigh";   desc="For the hardest tasks (Opus recommended)";           color=$EffortColors["xhigh"]  }
     @{ key="max";    label="max";     desc="Maximum reasoning; may lead to diminishing returns"; color=$EffortColors["max"]    }
     @{ key="ultracode"; label="ultracode"; desc="xhigh + standing dynamic workflows (needs an xhigh-capable Opus model)"; color=$EffortColors["ultracode"] }
 )
@@ -910,6 +1068,13 @@ function Get-PathChoices {
         $choices.bgColor    = $entry.bgColor
         if ($entry.extras) { $choices.extras = @($entry.extras) }
     }
+    # Menu keys used to be model ids and are family aliases now, so an id that meant "newest of
+    # this family" is folded onto that alias and the choice survives. Anything else an older
+    # launcher saved -- a pinned older model, a [1m] context variant -- has no row that can
+    # express it: it reaches the menu unmatched, opens on "inherit", and the next save
+    # overwrites it. That pin is lost either way, and losing it to "inherit" beats folding it,
+    # which would silently launch the newest model of its family instead of the pinned one.
+    if ($choices.model -and $LegacyModelIds.ContainsKey($choices.model)) { $choices.model = $LegacyModelIds[$choices.model] }
     return $choices
 }
 

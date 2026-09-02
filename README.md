@@ -194,8 +194,19 @@ Sets `--permission-mode`.
 
 ### Model tab
 
-Sets `--model`. Offers `inherit` plus the model catalog: Fable 5, Opus 5, Sonnet 5 and
-Haiku 4.5.
+Sets `--model`. Offers `inherit` plus Fable, Opus, Sonnet and Haiku, read out of the installed
+`claude` binary's own model catalog and cached per build, so a model release shows up without
+editing this launcher. Each row passes the bare family alias and is labelled with whatever that
+alias currently launches — which depends on the backend, so the same Sonnet row reads "Sonnet 5"
+on Anthropic's API and "Sonnet 4.5" with `CLAUDE_CODE_USE_BEDROCK` set. A saved choice therefore
+keeps meaning "the newest one" across releases.
+
+If the catalog cannot be read — an unreadable binary, or an npm install whose bundle is not where
+this expects — the rows lose their version numbers and everything else still works. A choice saved
+by a launcher older than this one is folded onto its family alias when that is what it meant; a
+pinned older model or a `[1m]` context variant is not, because no row can express it, so those
+reopen on `inherit` — and the next save drops them — rather than silently becoming the newest
+model of the family.
 
 ### Effort tab
 
@@ -207,7 +218,7 @@ Sets the session effort level.
 | **auto** | Adaptive — Claude picks the effort per turn |
 | **low** | Short, scoped, latency-sensitive tasks |
 | **medium** | Reduced token use for cost-sensitive work |
-| **high** | Balanced (default for Opus 5) |
+| **high** | Balanced (default for Opus) |
 | **xhigh** | The hardest tasks |
 | **max** | Maximum reasoning; can hit diminishing returns |
 | **ultracode** | `xhigh` plus standing dynamic workflow orchestration |

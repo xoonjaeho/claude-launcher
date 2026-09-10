@@ -210,7 +210,11 @@ model of the family.
 
 ### Effort tab
 
-Sets the session effort level.
+Sets the session effort level. The rows are per-model: the same scan that reads the model
+catalog also reads which levels each model accepts, which one it starts at, and what each
+costs relative to `high`. Moving the cursor on the Model tab rebuilds this one, and a level
+the model does not accept is left out rather than shown greyed. Haiku 4.5 has no effort
+control at all, so it offers only `inherit` and `auto`.
 
 | Level | Behavior |
 |-------|----------|
@@ -218,19 +222,41 @@ Sets the session effort level.
 | **auto** | Adaptive — Claude picks the effort per turn |
 | **low** | Short, scoped, latency-sensitive tasks |
 | **medium** | Reduced token use for cost-sensitive work |
-| **high** | Balanced (default for Opus) |
-| **xhigh** | The hardest tasks |
+| **high** | Balanced intelligence for everyday work |
+| **xhigh** | Deeper reasoning for the hardest tasks |
 | **max** | Maximum reasoning; can hit diminishing returns |
 | **ultracode** | `xhigh` plus standing dynamic workflow orchestration |
+
+`(default)` marks the level Claude Code itself would pick for that model, and the percentage
+is that model's own cost index for the level, with `high` as 100%:
+
+```
+   1. inherit
+   2. auto             — Adaptive — Claude picks effort per turn
+   3. low              — 67% Short, scoped, latency-sensitive tasks
+   4. medium           — 76% Reduced token usage for cost-sensitive work
+   5. high (default)   — 100% Balanced intelligence for everyday work
+   6. xhigh            — 160% Deeper reasoning for the hardest tasks
+   7. max              — 170% Maximum reasoning; may lead to diminishing returns
+   8. ultracode        — xhigh + standing dynamic workflows
+```
+
+The percentages differ per model — Sonnet 5 prices `xhigh` at 241% and `max` at 559%, Opus 5
+at 160% and 170% — which is the reason they are shown at all. A Claude Code the launcher cannot
+read costs the menu its percentages and its `(default)` marker, not its rows: the full ladder is
+offered, as it was before any of this was read. The ultracode guard below falls back with it, to
+its old Opus-or-Fable rule — so in that state a Sonnet 5 session that picks ultracode is still
+switched to Opus even though the menu offered it.
 
 Most levels are passed with `--effort`. `auto` and `ultracode` are not accepted by
 `--effort`, so the launcher injects them through a temporary `--settings` overlay
 instead.
 
-**ultracode** requires an xhigh-capable Opus or Fable model. If a non-capable model is in
-effect — Sonnet, Haiku, or an `opusplan` inherited from `settings.json`, which runs Sonnet
-outside plan mode — the launcher overrides the model to Opus and prints a notice before
-launching; otherwise ultracode would silently fall back to plain `xhigh`.
+**ultracode** requires an xhigh-capable model, which the catalog names — Fable, Opus and
+Sonnet 5 all qualify. If a non-capable model is in effect — Haiku, or an `opusplan` inherited
+from `settings.json`, which runs Sonnet outside plan mode — the launcher overrides the model
+to Opus and prints a notice before launching; otherwise ultracode would silently fall back to
+plain `xhigh`.
 
 ### Extras tab
 

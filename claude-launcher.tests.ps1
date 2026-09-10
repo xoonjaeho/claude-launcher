@@ -291,6 +291,64 @@ Scenario "config: the keyboard path launches the same way a click does" {
     else { Ok "the keyboard-picked item is what got launched" }
 }
 
+# The Effort tab is derived from the Model tab, and only a real console can show that the
+# derivation actually reaches the screen when the Model cursor moves. Model rows are ordered by
+# $ModelTiers: 1 inherit, 2 Fable, 3 Opus, 4 Sonnet, 5 Haiku.
+Scenario "config: the Effort tab follows the model" {
+    if (-not (Wait-Boot)) { Bad "the launcher never drew its first menu"; return }
+    if (-not (Click-Row '^\s*\S*\s*1\..*\(current\)')) { Bad "no current-directory row to click"; return }
+    if (-not (Wait-Row 'Configure this session')) { Bad "never reached the configuration screen"; return }
+    if (-not (Click-Row '\[ Permission \]' 'Model')) { Bad "no tab bar to click"; return }
+    if (-not (Wait-Row '\[ Model \]' 3000)) { Bad "the Model tab did not open"; return }
+    Send-Key 0x33 '3'          # Opus: the full ladder
+    Start-Sleep -Milliseconds 300
+    if (-not (Click-Row '\[ Model \]' 'Effort')) { Bad "could not reach the Effort tab"; return }
+    if (-not (Wait-Row '\[ Effort \]' 3000)) { Bad "the Effort tab did not open"; return }
+    # Which level is marked is the installed binary's call -- Opus 4.7 defaults to xhigh, Opus 5 to
+    # high -- so pin the marker, not the level, or a model release breaks a working launcher.
+    if (Wait-Row '\d+\. \S+ \(default\)' 2000) { Ok "the model's default level is marked" }
+    else { Bad "no default marker on the Opus ladder" }
+    # With the percentage: a bare xhigh row also exists in the catalog-less fallback ladder, so
+    # matching only the level would pass with the whole derivation removed.
+    if (Wait-Row '\d+\. xhigh\b.*\d+%' 2000) { Ok "a supported level is offered, priced" } else { Bad "Opus lost xhigh or its price" }
+
+    if (-not (Click-Row '\[ Effort \]' 'Model')) { Bad "could not get back to the Model tab"; return }
+    if (-not (Wait-Row '\[ Model \]' 3000)) { Bad "the Model tab did not reopen"; return }
+    Send-Key 0x35 '5'          # Haiku: no effort control at all
+    Start-Sleep -Milliseconds 300
+    if (-not (Click-Row '\[ Model \]' 'Effort')) { Bad "could not reach the Effort tab again"; return }
+    if (-not (Wait-Row '\[ Effort \]' 3000)) { Bad "the Effort tab did not reopen"; return }
+    if (-not (Wait-Row '\d+\. auto\b' 2000)) { Bad "the Effort tab lost every row"; return }
+    if (Wait-Row '\d+\. (low|medium|high|xhigh|max)\b' 1500) { Bad "a model with no effort control still offered levels" }
+    else { Ok "a model with no effort control offers none" }
+}
+
+# A click on a Model row is the one path that changes the model and launches without drawing
+# another frame, so it is the one that shipped a level the new model does not accept.
+Scenario "config: clicking a model launches without the previous model's effort" {
+    if (-not (Wait-Boot)) { Bad "the launcher never drew its first menu"; return }
+    if (-not (Click-Row '^\s*\S*\s*1\..*\(current\)')) { Bad "no current-directory row to click"; return }
+    if (-not (Wait-Row 'Configure this session')) { Bad "never reached the configuration screen"; return }
+    if (-not (Click-Row '\[ Permission \]' 'Model')) { Bad "no tab bar to click"; return }
+    if (-not (Wait-Row '\[ Model \]' 3000)) { Bad "the Model tab did not open"; return }
+    Send-Key 0x33 '3'          # Opus, whose ladder has max
+    Start-Sleep -Milliseconds 300
+    if (-not (Click-Row '\[ Model \]' 'Effort')) { Bad "could not reach the Effort tab"; return }
+    if (-not (Wait-Row '\[ Effort \]' 3000)) { Bad "the Effort tab did not open"; return }
+    Send-Key 0x37 '7'          # max
+    Start-Sleep -Milliseconds 300
+    # Without this the assertion below would also pass having selected nothing at all.
+    if (-not (Wait-Row 'Effort\s+max\b' 2000)) { Bad "max was not selected on the Effort tab"; return }
+    if (-not (Click-Row '\[ Effort \]' 'Model')) { Bad "could not get back to the Model tab"; return }
+    if (-not (Wait-Row '\[ Model \]' 3000)) { Bad "the Model tab did not reopen"; return }
+    if (-not (Click-Row '\d+\. Haiku')) { Bad "the Model tab has no Haiku row"; return }
+    $bat = Get-LaunchBat
+    if ($bat -notmatch '--model haiku') { Bad "the clicked model did not launch: $($bat -replace '\r?\n', ' | ')"; return }
+    Ok "the clicked model launched"
+    if ($bat -match '--effort') { Bad "carried the previous model's effort: $($bat -replace '\r?\n', ' | ')" }
+    else { Ok "a level Haiku does not accept was dropped" }
+}
+
 Scenario "input queued before a transition must not act on the next screen" {
     if (-not (Wait-Boot)) { Bad "the launcher never drew its first menu"; return }
     $b = Wait-Row 'Browse'

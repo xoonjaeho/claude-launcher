@@ -87,6 +87,15 @@ $EffortColors = @{
     "max"    = "$ESC[38;2;235;95;87m"     # rainbow_red (static approx)
     "ultracode" = "$ESC[38;2;236;72;153m" # magenta (top tier: xhigh + workflows)
 }
+# One line per level. The launcher supplies these, not the binary: Claude Code's own strings
+# run two to three times longer and would wrap the menu row on a normal-width console.
+$EffortDescs = @{
+    "low"    = "Short, scoped, latency-sensitive tasks"
+    "medium" = "Reduced token usage for cost-sensitive work"
+    "high"   = "Balanced intelligence for everyday work"
+    "xhigh"  = "Deeper reasoning for the hardest tasks"
+    "max"    = "Maximum reasoning; may lead to diminishing returns"
+}
 $ModelColors = @{
     "fable"  = "$ESC[38;2;229;192;123m"   # gold (newest flagship)
     "opus"   = "$ESC[38;2;215;119;87m"    # Claude brand orange
@@ -359,10 +368,48 @@ function Parse-ModelCatalog {
     param([string]$Text, [string]$Provider)
     $names = @{}
     $families = @{}
-    foreach ($m in [regex]::Matches($Text, '\{id:"(?<id>claude-[a-z0-9-]+)",family:"(?<fam>[a-z]+)",display_name:"(?<name>[^"]+)"')) {
+    $hits = [regex]::Matches($Text, '\{id:"(?<id>claude-[a-z0-9-]+)",family:"(?<fam>[a-z]+)",display_name:"(?<name>[^"]+)"')
+    foreach ($m in $hits) {
         $id = $m.Groups["id"].Value
         $names[$id]    = $m.Groups["name"].Value
         $families[$id] = $m.Groups["fam"].Value
+    }
+
+    # The same records carry the effort table: `capabilities` gates which levels a model accepts,
+    # `default_effort` marks the one it starts at, and `effort_cost_index` prices each level with
+    # high = 1. The records sit in one contiguous array, so this walks a window from the first of
+    # them instead of running a second pass over 200 MB. A model with no "effort" capability is
+    # kept with an empty level list -- that is what tells the menu to offer none, as opposed to a
+    # model the parser never saw, which still gets the full ladder.
+    $effort = @()
+    if ($hits.Count -gt 0) {
+        # Ends a record's length past the LAST record rather than at a fixed size: a fixed window
+        # both truncates if the registry grows and lets the final chunk read `default_effort:`
+        # out of whatever code follows the array.
+        $span = $hits[$hits.Count - 1].Index - $hits[0].Index + 4000
+        $win  = $Text.Substring($hits[0].Index, [Math]::Min($span, $Text.Length - $hits[0].Index))
+        foreach ($chunk in ($win -split '(?=\{id:"claude-)')) {
+            $rid = [regex]::Match($chunk, '^\{id:"(claude-[a-z0-9-]+)"')
+            if (-not $rid.Success) { continue }
+            $caps = [regex]::Match($chunk, 'capabilities:\[(?<c>[^\]]*)\]').Groups["c"].Value
+            $levels = @()
+            if ($caps -like '*"effort"*') {
+                $levels = @("low", "medium", "high")
+                if ($caps -like '*"xhigh_effort"*') { $levels += "xhigh" }
+                if ($caps -like '*"max_effort"*')   { $levels += "max" }
+            }
+            $cost = @{}
+            $ci = [regex]::Match($chunk, 'effort_cost_index:\{(?<i>[^}]*)\}')
+            if ($ci.Success) {
+                foreach ($pair in ($ci.Groups["i"].Value -split ',')) {
+                    $kv = $pair -split ':'
+                    if ($kv.Count -eq 2 -and $levels -contains $kv[0]) { $cost[$kv[0]] = [double]$kv[1] }
+                }
+            }
+            $de = [regex]::Match($chunk, 'default_effort:"(?<d>[a-z]+)"').Groups["d"].Value
+            if (-not $de) { $de = "high" }
+            $effort += @{ id = $rid.Groups[1].Value; levels = $levels; default = $de; cost = $cost }
+        }
     }
     # Bounded lazy match: the empty `aliases:{}` schema default cannot start with a family entry so
     # the engine walks past it, and the cap stops a missing terminator from dragging over 200 MB.
@@ -380,7 +427,53 @@ function Parse-ModelCatalog {
         if ($families[$id] -eq $fam) { $latest[$fam] = $id }
     }
     if ($latest.Count -eq 0) { return $null }
-    return @{ latest = $latest; names = $names }
+    return @{ latest = $latest; names = $names; effort = $effort }
+}
+
+# What the installed Claude Code says this family's current model does with effort: which levels
+# it accepts, which one it starts at, what each costs relative to high. $null means the catalog
+# could not be read -- callers then fall back to the full ladder, which is what the launcher
+# offered before it could tell. A model that simply has no effort control answers with an empty
+# level list, which is a different thing and must not be confused with $null.
+function Get-ModelEffort {
+    param([string]$Model)
+    if (-not $Model -or -not $claudeModels -or -not $claudeModels.effort) { return $null }
+    # $Model is a family alias from a menu row, but settings.json may pin a full id (optionally
+    # with a [1m] context suffix) and THAT is what the session runs -- so an id match comes first.
+    # Folding it to its family instead would price Opus 4.7 as Opus 5 and read the wrong default.
+    $rec = @($claudeModels.effort | Where-Object { $_.id -eq ($Model -replace '\[.*$', '') })
+    if ($rec.Count -eq 0) {
+        $id = $claudeModels.latest[$Model]
+        if (-not $id) { return $null }
+        $rec = @($claudeModels.effort | Where-Object { $_.id -eq $id })
+    }
+    if ($rec.Count -eq 0) { return $null }
+    return $rec[0]
+}
+
+# The Effort menu for one model. Levels the model does not accept are left out rather than greyed
+# out: the list is short, and a row that cannot be chosen is just noise. "ultracode" is xhigh plus
+# workflows, so it rides on xhigh being there at all.
+function Get-EffortOptions {
+    param([string]$Model)
+    $rec    = Get-ModelEffort $Model
+    $levels = if ($rec) { @($rec.levels) } else { @("low", "medium", "high", "xhigh", "max") }
+    $opts = @(
+        @{ key=$null;  label="inherit"; desc=$effortInheritDesc;                         color=$WH }
+        @{ key="auto"; label="auto";    desc="Adaptive — Claude picks effort per turn"; color=$EffortColors["auto"] }
+    )
+    foreach ($lv in $levels) {
+        $c   = if ($rec -and $rec.cost) { $rec.cost.$lv } else { $null }
+        $pct = if ($c) { "$([math]::Round([double]$c * 100))% " } else { "" }
+        $opts += @{ key   = $lv
+                    label = $(if ($rec -and $rec.default -eq $lv) { "$lv (default)" } else { $lv })
+                    desc  = "$pct$($EffortDescs[$lv])"
+                    color = $EffortColors[$lv] }
+    }
+    if ($levels -contains "xhigh") {
+        $opts += @{ key="ultracode"; label="ultracode"; desc="xhigh + standing dynamic workflows"; color=$EffortColors["ultracode"] }
+    }
+    return $opts
 }
 
 if ($SelfTest) {
@@ -517,7 +610,7 @@ if ($SelfTest) {
     # Every assertion below is written `-not $cat -or ...`: on a $null catalog the indexing alone
     # raises a NullArray error that PS 5.1 does not treat as terminating, so the `if` would be
     # abandoned and the run would reach "SelfTest OK" having tested nothing.
-    $catFixture = 'aliases:{opus:{default:"claude-opus-5",per_provider:{bedrock:"claude-opus-4-6"}},fable:{default:"claude-fable-5-1"},sonnet:{default:"claude-sonnet-5"},haiku:{default:"claude-haiku-4-5"},mythos:{default:"claude-mythos-5"}},defaults:{},{id:"claude-opus-5",family:"opus",display_name:"Opus 5",cost:1},{id:"claude-opus-4-6",family:"opus",display_name:"Opus 4.6"},{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1"},{id:"claude-sonnet-5",family:"sonnet",display_name:"Sonnet 5"},{id:"claude-haiku-4-5",family:"haiku",display_name:"Haiku 4.5"},{id:"claude-mythos-5",family:"mythos",display_name:""}'
+    $catFixture = 'aliases:{opus:{default:"claude-opus-5",per_provider:{bedrock:"claude-opus-4-6"}},fable:{default:"claude-fable-5-1"},sonnet:{default:"claude-sonnet-5"},haiku:{default:"claude-haiku-4-5"},mythos:{default:"claude-mythos-5"}},defaults:{},{id:"claude-opus-5",family:"opus",display_name:"Opus 5",capabilities:["effort","max_effort","xhigh_effort"],default_effort:"high",effort_cost_index:{low:0.67,medium:0.76,high:1,xhigh:1.6,max:1.7},cost:1},{id:"claude-opus-4-6",family:"opus",display_name:"Opus 4.6",capabilities:["effort","max_effort"],default_effort:"high"},{id:"claude-fable-5-1",family:"fable",display_name:"Fable 5.1",capabilities:["effort","max_effort","xhigh_effort"],default_effort:"xhigh"},{id:"claude-sonnet-5",family:"sonnet",display_name:"Sonnet 5",capabilities:["effort","max_effort","xhigh_effort"],default_effort:"high"},{id:"claude-haiku-4-5",family:"haiku",display_name:"Haiku 4.5",capabilities:["context_management"]},{id:"claude-mythos-5",family:"mythos",display_name:""}'
     $cat = Parse-ModelCatalog $catFixture ""
     if (-not $cat) { throw "SelfTest: the model catalog did not parse at all" }
     # mythos is in the fixture with an empty display name: an unlabelled family must not reach a row.
@@ -538,6 +631,43 @@ if ($SelfTest) {
     if (-not $catP -or $catP.latest["haiku"]) { throw "SelfTest: a family with no display name was kept" }
     if (-not $catP -or $catP.names[$catP.latest["opus"]] -ne "Opus 5") { throw "SelfTest: one unusable family took the others down with it" }
 
+    # Effort rides those same records. A model with no effort control is kept with an empty
+    # ladder, which is what makes it different from one the parser never saw.
+    $eOpus = @($cat.effort | Where-Object { $_.id -eq "claude-opus-5" })
+    if ($eOpus.Count -ne 1) { throw "SelfTest: the effort table lost Opus 5" }
+    if ((@($eOpus[0].levels) -join ",") -ne "low,medium,high,xhigh,max") { throw "SelfTest: Opus 5 lost an effort level ($(@($eOpus[0].levels) -join ','))" }
+    # Read off Fable, whose fixture default is xhigh: Opus's is `high`, which is also the parser's
+    # own fallback, so asserting on it would pass with the default_effort read deleted.
+    $eFable = @($cat.effort | Where-Object { $_.id -eq "claude-fable-5-1" })
+    if ($eFable.Count -ne 1 -or $eFable[0].default -ne "xhigh") { throw "SelfTest: default_effort was not read" }
+    if ($eOpus[0].cost["high"] -ne 1) { throw "SelfTest: effort_cost_index was not read" }
+    $eHaiku = @($cat.effort | Where-Object { $_.id -eq "claude-haiku-4-5" })
+    if ($eHaiku.Count -ne 1 -or @($eHaiku[0].levels).Count -ne 0) { throw "SelfTest: a model with no effort capability must be kept with an empty ladder" }
+
+    # ...and the menu is nothing but that table rendered: absent levels, a marked default, and the
+    # cost index as a percentage.
+    $claudeModels = $cat
+    $oOpus = @(Get-EffortOptions "opus")
+    if ((($oOpus | ForEach-Object { $_.key }) -join ",") -ne ",auto,low,medium,high,xhigh,max,ultracode") { throw "SelfTest: the Opus effort menu changed shape ($(($oOpus | ForEach-Object { $_.key }) -join ','))" }
+    $hi = $oOpus | Where-Object { $_.key -eq "high" }
+    if ($hi.label -ne "high (default)") { throw "SelfTest: the default level was not marked ($($hi.label))" }
+    if ($hi.desc -notlike "100% *") { throw "SelfTest: high is not priced at 100% of itself ($($hi.desc))" }
+    if (($oOpus | Where-Object { $_.key -eq "low" }).desc -notlike "67% *") { throw "SelfTest: the cost index did not become a percentage" }
+
+    $oHaiku = @(Get-EffortOptions "haiku")
+    if ((($oHaiku | ForEach-Object { $_.key }) -join ",") -ne ",auto") { throw "SelfTest: a model with no effort control still offered levels" }
+
+    # The marker follows the model, and only one row may carry it.
+    $oFable = @(Get-EffortOptions "fable")
+    if (($oFable | Where-Object { $_.key -eq "xhigh" }).label -ne "xhigh (default)") { throw "SelfTest: a non-high default was not marked" }
+    if (($oFable | Where-Object { $_.key -eq "high" }).label -ne "high") { throw "SelfTest: two rows claimed the default" }
+
+    # An unreadable catalog keeps the full ladder; that is the pre-effort behaviour.
+    $claudeModels = $null
+    if ((@(Get-EffortOptions "opus") | ForEach-Object { $_.key }) -join "," -ne ",auto,low,medium,high,xhigh,max,ultracode") { throw "SelfTest: an unreadable catalog narrowed the menu" }
+    $claudeModels = $catB
+    if ((@(Get-EffortOptions "opus") | ForEach-Object { $_.key }) -join "," -ne ",auto,low,medium,high,max") { throw "SelfTest: a model without xhigh still offered xhigh or ultracode" }
+    $claudeModels = $null
     if (Parse-ModelCatalog ($catFixture -replace 'aliases:\{', 'aliases:{}x') "") { throw "SelfTest: a catalog with no alias table must return nothing" }
 
     Write-Host "SelfTest OK"
@@ -594,12 +724,14 @@ function Get-ModelCatalog {
         $c = Get-Content $cachePath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
         if ($c.stamp -eq $stamp) {
             if ($c.failed) { return $null }
-            $cached = @{ latest = @{}; names = @{} }
+            $cached = @{ latest = @{}; names = @{}; effort = @($c.effort) }
             $c.latest.PSObject.Properties | ForEach-Object { $cached.latest[$_.Name] = $_.Value }
             $c.names.PSObject.Properties  | ForEach-Object { $cached.names[$_.Name]  = $_.Value }
             # The same invariant Parse-ModelCatalog enforces, so a hand-edited cache gets no
             # further than a freshly parsed one.
-            $ok = $cached.latest.Count -gt 0
+            # A cache written before this launcher knew about effort carries no such key:
+            # reparse rather than serve a menu with every level missing.
+            $ok = $cached.latest.Count -gt 0 -and $null -ne $c.effort
             foreach ($fam in @($cached.latest.Keys)) { if (-not $cached.names[$cached.latest[$fam]]) { $ok = $false } }
             if ($ok) { return $cached }
         }
@@ -607,11 +739,11 @@ function Get-ModelCatalog {
     Write-Host "Reading the model catalog from $(Split-Path $exe -Leaf)..."
     # 28591 is Latin-1: [Text.Encoding]::Latin1 does not exist on the PS 5.1 the .bat starts.
     $cat = try { Parse-ModelCatalog ([Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))) $provider } catch { $null }
-    $entry = if ($cat) { @{ stamp = $stamp; latest = $cat.latest; names = $cat.names } } else { @{ stamp = $stamp; failed = $true } }
+    $entry = if ($cat) { @{ stamp = $stamp; latest = $cat.latest; names = $cat.names; effort = $cat.effort } } else { @{ stamp = $stamp; failed = $true } }
     # Publish by rename: two launchers cold-starting together must never read a half-written file.
     $tmpPath = "$cachePath.$PID.tmp"
     try {
-        $entry | ConvertTo-Json -Depth 3 | Set-Content -Path $tmpPath -Encoding UTF8
+        $entry | ConvertTo-Json -Depth 6 | Set-Content -Path $tmpPath -Encoding UTF8
         Move-Item -LiteralPath $tmpPath -Destination $cachePath -Force
     } catch { Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue }
     return $cat
@@ -702,6 +834,9 @@ $permInheritDesc  = "Claude Code default"
 $modelInheritVal  = Format-ModelLabel $settingsModel
 $modelInheritDesc = if ($modelInheritVal)    { "$modelInheritVal (Use settings.json value)" }    else { "Use settings.json value" }
 $effortInheritDesc = if ($settingsEffort)    { "$settingsEffort (Use settings.json value)" }      else { "Use settings.json value" }
+# Leaving Model on `inherit` launches whatever settings.json names -- id, alias or nothing -- so
+# that value, not its family, is the model whose effort table the menu must start from.
+$inheritModel = $settingsModel
 
 # --- Org: skip personal pattern ---
 if ($corg -and $cemail -and $corg -eq "$cemail's Organization") {
@@ -984,20 +1119,9 @@ foreach ($m in $modelCatalog) {
     $models += @{ key = $m.id; label = $m.name; desc = $desc; color = $color }
 }
 
-$efforts = @(
-    @{ key=$null;    label="inherit"; desc=$effortInheritDesc;                                   color=$WH }
-    @{ key="auto";   label="auto";    desc="Adaptive — Claude picks effort per turn";            color=$EffortColors["auto"]   }
-    @{ key="low";    label="low";     desc="Short, scoped, latency-sensitive tasks";             color=$EffortColors["low"]    }
-    @{ key="medium"; label="medium";  desc="Reduced token usage for cost-sensitive work";        color=$EffortColors["medium"] }
-    @{ key="high";   label="high";    desc="Default for Opus — balanced intelligence";           color=$EffortColors["high"]   }
-    @{ key="xhigh";  label="xhigh";   desc="For the hardest tasks (Opus recommended)";           color=$EffortColors["xhigh"]  }
-    @{ key="max";    label="max";     desc="Maximum reasoning; may lead to diminishing returns"; color=$EffortColors["max"]    }
-    @{ key="ultracode"; label="ultracode"; desc="xhigh + standing dynamic workflows (needs an xhigh-capable Opus model)"; color=$EffortColors["ultracode"] }
-)
 
 $permItems   = @(); foreach ($m in $permModes) { $permItems   += "$($m.color)$($m.label)$R  ${IN}— $($m.desc)$R" }
 $modelItems  = @(); foreach ($m in $models)    { $modelItems  += "$($m.color)$($m.label)$R  ${IN}— $($m.desc)$R" }
-$effortItems = @(); foreach ($m in $efforts)   { $effortItems += "$($m.color)$($m.label)$R  ${IN}— $($m.desc)$R" }
 
 $extrasCatalog = @(
     # Integrations
@@ -1110,12 +1234,16 @@ function Show-TabbedConfig {
     if ($null -ne $choices) {
         $permStart   = Find-OptionIndex -Arr $permModes -Key $choices.permission -Default $permDefaultIndex
         $modelStart  = Find-OptionIndex -Arr $models    -Key $choices.model      -Default $modelDefaultIndex
-        $effortStart = Find-OptionIndex -Arr $efforts   -Key $choices.effort     -Default $effortDefaultIndex
     } else {
         $permStart   = $permDefaultIndex
         $modelStart  = $modelDefaultIndex
-        $effortStart = $effortDefaultIndex
     }
+    # The Effort tab opens on the SAVED model's ladder, not on settings.json's: a saved level that
+    # the inherit-model happens not to offer would otherwise collapse to `inherit` right here,
+    # before the first sync could carry it over, and the next save would write the loss back.
+    $startEfforts = @(Get-EffortOptions $(if ($null -ne $choices -and $choices.model) { $choices.model } else { $inheritModel }))
+    $effortStart  = if ($null -ne $choices) { Find-OptionIndex -Arr $startEfforts -Key $choices.effort -Default $effortDefaultIndex }
+                    else { $effortDefaultIndex }
 
     # Colors are terminal settings, not CLI flags, so they stay out of $extrasSelected — the launch
     # loop looks up a flag per selected extra and would find none. -1 off, 0 random, 1..N palette.
@@ -1143,13 +1271,17 @@ function Show-TabbedConfig {
     $tabs = @(
         @{ name = "Permission"; items = $permItems;   modes = $permModes;    cursor = $permStart;   isMulti = $false }
         @{ name = "Model";      items = $modelItems;  modes = $models;       cursor = $modelStart;  isMulti = $false }
-        @{ name = "Effort";     items = $effortItems; modes = $efforts;      cursor = $effortStart; isMulti = $false }
+        # forModel: which Model row this tab was built for. The sentinel is not a real key, so
+        # Sync-EffortTab always runs once before anything is drawn or read -- which is also what
+        # fills in `items`.
+        @{ name = "Effort";     items = @();          modes = $startEfforts; cursor = $effortStart; isMulti = $false; forModel = "*unset*" }
         @{ name = "Extras";     items = @();          modes = $extrasCatalog; cursor = 0;           isMulti = $true  }
     )
 
     $activeTab = 0
     $tabNames  = @($tabs | ForEach-Object { $_.name })
-    $maxItems = ($tabs | ForEach-Object { if ($_.isMulti) { $extrasCatalog.Count } else { $_.items.Count } } | Measure-Object -Maximum).Maximum
+    # modes and items are 1:1, and modes are filled first, so the viewport is sized off modes.
+    $maxItems = ($tabs | ForEach-Object { if ($_.isMulti) { $extrasCatalog.Count } else { $_.modes.Count } } | Measure-Object -Maximum).Maximum
     # Render draws $maxItems + 5 lines down from $tabBarTop. Scroll that space in now: in a
     # short window the buffer would otherwise scroll mid-render and every later frame would
     # draw from a stale $tabBarTop, stranding rows of the previous tab on screen.
@@ -1167,6 +1299,7 @@ function Show-TabbedConfig {
 
     # Enter and a click both leave through here, so the two can never return different things.
     function Get-Result {
+        Sync-EffortTab
         return @{
             permission = $tabs[0].modes[$tabs[0].cursor].key
             model      = $tabs[1].modes[$tabs[1].cursor].key
@@ -1233,7 +1366,24 @@ function Show-TabbedConfig {
         return ($vals -join " ${IN}·$R ")
     }
 
+    # Effort is a function of the model: rebuild that tab whenever the Model cursor lands somewhere
+    # new, keeping the chosen level if the new model still offers it. Both Render AND Get-Result
+    # call this, because a click on a Model row moves that cursor and returns the result without
+    # ever drawing another frame -- which is how a level the new model does not accept reached
+    # --effort.
+    function Sync-EffortTab {
+        $mk = $tabs[1].modes[$tabs[1].cursor].key
+        if ($tabs[2].forModel -eq $mk -and $tabs[2].items.Count -eq $tabs[2].modes.Count) { return }
+        $tabs[2].forModel = $mk
+        $keep  = $tabs[2].modes[$tabs[2].cursor].key
+        $modes = @(Get-EffortOptions $(if ($mk) { $mk } else { $inheritModel }))
+        $tabs[2].modes  = $modes
+        $tabs[2].items  = @(foreach ($m in $modes) { "$($m.color)$($m.label)$R  ${IN}— $($m.desc)$R" })
+        $tabs[2].cursor = Find-OptionIndex -Arr $modes -Key $keep -Default 0
+    }
+
     function Render {
+        Sync-EffortTab
         [Console]::SetCursorPosition(0, $tabBarTop)
         $bar = "   "
         foreach ($seg in (Get-TabSegments -Names $tabNames -Active $activeTab)) {
@@ -1452,16 +1602,18 @@ if ($isLocal) {
 Save-PathChoices -Path $selectedPath -Permission $selectedPermission -Model $selectedModel -Effort $selectedEffort `
                  -Extras $selectedExtras -TabColor $selectedTabChoice -BgColor $selectedBgChoice
 
-# ultracode needs an xhigh-capable (Opus or Fable) model. Resolve the effective model and force Opus if needed.
+# ultracode needs an xhigh-capable model. Resolve the effective model and force Opus if needed.
 # Runs after Save-PathChoices so the user's real model choice is preserved in per-path state.
 # Capture the overridden model so the launch step can show a notice (this point gets cleared by Clear-Host).
 $ultraForcedFrom = $null
 if ($selectedEffort -eq "ultracode") {
     $effModel = if ($selectedModel) { $selectedModel } else { $settingsModel }
     # opusplan runs Sonnet outside plan mode, so it is NOT xhigh-capable despite the "opus" substring.
-    # Fable 5 supports xhigh (same effort range as Opus 5), so it counts as capable too.
+    # Which families do support xhigh comes from the catalog, not a list kept here: Sonnet 5 does,
+    # and hard-coding Opus/Fable would send it to Opus for no reason.
     $effTier = Get-ModelTier $effModel
-    $isXhighCapable = ($effModel -notlike "opusplan*") -and ($effTier -eq "opus" -or $effTier -eq "fable")
+    $effRec  = Get-ModelEffort $effModel
+    $isXhighCapable = ($effModel -notlike "opusplan*") -and $(if ($effRec) { @($effRec.levels) -contains "xhigh" } else { $effTier -eq "opus" -or $effTier -eq "fable" })
     if (-not $isXhighCapable) {
         if ($selectedModel) { $ultraForcedFrom = $selectedModel }
         $selectedModel = "opus"

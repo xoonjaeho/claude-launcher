@@ -1,3 +1,8 @@
 /.claude/
 /docs/
 /.test-many-dirs/
+
+# >>> scaffolds >>>
+# Serena MCP writes this on project activation
+.serena/
+# <<< scaffolds <<<

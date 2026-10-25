@@ -287,10 +287,34 @@ try {
 
 # --- scenarios ---------------------------------------------------------------------------------
 
-function Scenario([string]$Name, [scriptblock]$Body) {
+function Scenario([string]$Name, [scriptblock]$Body, [string]$UserProfile) {
     Say $Name
     Clear-LaunchBat
-    try { Start-Launcher; & $Body } catch { Bad "threw: $_" } finally { Stop-Launcher }
+    $prevProfile = $env:USERPROFILE
+    try { if ($UserProfile) { $env:USERPROFILE = $UserProfile }; Start-Launcher; & $Body } catch { Bad "threw: $_" }
+    finally { $env:USERPROFILE = $prevProfile; Stop-Launcher }
+}
+
+# Which menu model lacks effort control is the installed catalog's call, and a catalog can give
+# every family the full ladder. The scenarios that need one without it run on a copy of the real
+# profile whose cached catalog has the menu's Haiku ladder emptied; the cache stamp still matches
+# the installed binary, so the launcher uses it instead of rescanning.
+function New-NoEffortHaikuProfile {
+    $dir  = Join-Path $env:TEMP "claude-launcher-no-effort-profile"
+    $real = Join-Path $env:USERPROFILE ".claude"
+    $cache = Get-Content (Join-Path $real "claude-launcher-models.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    $haiku = @($cache.effort | Where-Object { $_.id -eq $cache.latest.haiku })
+    if ($haiku.Count -ne 1) { throw "the cached catalog has no entry for $($cache.latest.haiku)" }
+    $haiku[0].levels = @(); $haiku[0].cost = @{}
+    # The same project names as the real profile keep the launcher in the known-project flow these
+    # scenarios click through; the launcher reads only the directory names.
+    Get-ChildItem (Join-Path $real "projects") -Directory | ForEach-Object {
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir ".claude\projects\$($_.Name)") | Out-Null
+    }
+    $settings = Join-Path $real "settings.json"
+    if (Test-Path $settings) { Copy-Item $settings (Join-Path $dir ".claude\settings.json") -Force }
+    [IO.File]::WriteAllText((Join-Path $dir ".claude\claude-launcher-models.json"), ($cache | ConvertTo-Json -Depth 10 -Compress), [System.Text.UTF8Encoding]::new($false))
+    return $dir
 }
 
 # The launcher's first screen, after `claude --version` and `claude auth status` have returned.
@@ -364,7 +388,8 @@ Scenario "config: the keyboard path launches the same way a click does" {
 # The Effort tab is derived from the Model tab, and only a real console can show that the
 # derivation actually reaches the screen when the Model cursor moves. Model rows are ordered by
 # $ModelTiers: 1 inherit, 2 Fable, 3 Opus, 4 Sonnet, 5 Haiku.
-Scenario "config: the Effort tab follows the model" {
+$noEffortProfile = try { New-NoEffortHaikuProfile } catch { Bad "could not seed a catalog without Haiku effort: $_"; $null }
+Scenario "config: the Effort tab follows the model" -UserProfile $noEffortProfile {
     if (-not (Wait-Boot)) { Bad "the launcher never drew its first menu"; return }
     if (-not (Click-Row '^\s*\S*\s*1\..*\(current\)')) { Bad "no current-directory row to click"; return }
     if (-not (Wait-Row 'Configure this session')) { Bad "never reached the configuration screen"; return }
@@ -395,7 +420,7 @@ Scenario "config: the Effort tab follows the model" {
 
 # A click on a Model row is the one path that changes the model and launches without drawing
 # another frame, so it is the one that shipped a level the new model does not accept.
-Scenario "config: clicking a model launches without the previous model's effort" {
+Scenario "config: clicking a model launches without the previous model's effort" -UserProfile $noEffortProfile {
     if (-not (Wait-Boot)) { Bad "the launcher never drew its first menu"; return }
     if (-not (Click-Row '^\s*\S*\s*1\..*\(current\)')) { Bad "no current-directory row to click"; return }
     if (-not (Wait-Row 'Configure this session')) { Bad "never reached the configuration screen"; return }
@@ -481,6 +506,7 @@ Scenario "browse: a long list is windowed and the wheel scrolls it" {
 } finally {
     Stop-Launcher
     if (Test-Path $fixture) { Remove-Item $fixture -Recurse -Force }
+    if ($noEffortProfile -and (Test-Path $noEffortProfile)) { Remove-Item $noEffortProfile -Recurse -Force }
     Clear-LaunchBat          # the last launching scenario leaves one behind otherwise
 }
 

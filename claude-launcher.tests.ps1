@@ -204,6 +204,76 @@ $out.Add("=== claude-launcher -SelfTest ===")
 $st = & powershell -NoProfile -File $Launcher -SelfTest 2>&1
 if (($st -join "`n") -match 'SelfTest OK') { Ok "-SelfTest" } else { Bad "-SelfTest: $($st -join ' ')" }
 
+# -NoMenu -DryRun is what Claude drives from a console-less shell, so these run it as a plain
+# subprocess and read only its exit code, stderr and last stdout line. USERPROFILE points at a
+# seeded profile: a saved per-path choice the launch must ignore, and a defaultMode it must report.
+$out.Add("")
+$out.Add("=== -NoMenu -DryRun ===")
+$here        = Split-Path $Launcher -Parent
+$profileDir  = Join-Path $env:TEMP "claude-launcher-nomenu-profile"
+$seededState = Join-Path $profileDir ".claude\claude-launcher.json"
+$realState   = Join-Path $env:USERPROFILE ".claude\claude-launcher.json"
+$realProfile = $env:USERPROFILE
+$prevClaudeCode = $env:CLAUDECODE
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+New-Item -ItemType Directory -Path (Join-Path $profileDir ".claude") -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $profileDir ".claude\settings.json"), '{"permissions":{"defaultMode":"plan"}}', $utf8)
+[IO.File]::WriteAllText($seededState, (@{ perPath = @{ $here = @{ permission = "bypassPermissions"; model = "opus"; effort = "max"; extras = @() } } } | ConvertTo-Json -Depth 5), $utf8)
+function Get-Sha($p) { if (Test-Path $p) { (Get-FileHash $p -Algorithm SHA256).Hash } else { "absent" } }
+$seededHash = Get-Sha $seededState
+$realHash   = Get-Sha $realState
+
+function Invoke-DryRun([string[]]$LauncherArgs) {
+    $prevEnc = [Console]::OutputEncoding
+    [Console]::OutputEncoding = $utf8          # the child writes UTF-8; the prompt below is Korean
+    try { $lines = @(& powershell -NoProfile -File $Launcher -NoMenu -DryRun @LauncherArgs 2>&1); $code = $LASTEXITCODE }
+    finally { [Console]::OutputEncoding = $prevEnc }
+    $stdout = @($lines | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+    $json = $null
+    if ($stdout.Count -gt 0) { try { $json = $stdout[-1] | ConvertFrom-Json } catch {} }
+    [pscustomobject]@{ Code = $code; Json = $json; Stdout = ($stdout -join " | ")
+                       Stderr = (@($lines | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join " ") }
+}
+function Test-Rejected($Name, $R) {
+    if ($R.Code -eq 1 -and -not $R.Json) { Ok "$Name -> exit 1, no JSON" } else { Bad "$Name -> exit $($R.Code), stdout: $($R.Stdout)" }
+}
+
+try {
+    $env:USERPROFILE = $profileDir
+    $env:CLAUDECODE  = "1"
+    $r = Invoke-DryRun @("-Path", $here)
+    if ($r.Code -ne 0 -or -not $r.Json) { Bad "(a) a plain run did not end in JSON: exit $($r.Code), stderr: $($r.Stderr)" }
+    else {
+        if (@($r.Json.argv).Count -eq 0 -and $null -eq $r.Json.env.EFFORT_LEVEL) { Ok "(a) every option omitted -> no flags, no EFFORT_LEVEL, despite a saved choice" }
+        else { Bad "(a) omitted options produced argv [$(@($r.Json.argv) -join ' ')] EFFORT_LEVEL=$($r.Json.env.EFFORT_LEVEL)" }
+        if ($r.Json.inheritedMode -eq "plan" -and $r.Json.cwd -eq $here) { Ok "inheritedMode read from permissions.defaultMode, cwd resolved" }
+        else { Bad "inheritedMode=$($r.Json.inheritedMode) cwd=$($r.Json.cwd)" }
+        if (@($r.Json.envRemoved) -contains "CLAUDECODE") { Ok "(m) CLAUDECODE is removed before launch" }
+        else { Bad "(m) envRemoved lacks CLAUDECODE: [$(@($r.Json.envRemoved) -join ' ')]" }
+    }
+
+    $prompt = "한글 `"fix this`" ; %PATH% & C:\dir with space\`n/next"
+    $hex = -join ([Text.Encoding]::UTF8.GetBytes($prompt) | ForEach-Object { $_.ToString("x2") })
+    $r = Invoke-DryRun @("-Path", $here, "-Mode", "plan", "-PromptHex", $hex)
+    $want = @("--permission-mode", "plan", "--", $prompt)
+    $got  = @(if ($r.Json) { $r.Json.argv })
+    if ($r.Code -eq 0 -and $got.Count -eq $want.Count -and -not (Compare-Object $got $want -SyncWindow 0 -CaseSensitive)) { Ok "(l) a hex prompt lands after -- verbatim, last line is JSON" }
+    else { Bad "(l) exit $($r.Code), argv [$($got -join ' | ')], stderr: $($r.Stderr)" }
+
+    $r = Invoke-DryRun @("-Path", $here, "-Mode", "bogus")
+    Test-Rejected "(d) -Mode bogus" $r
+    if ($r.Stderr -match 'bypassPermissions') { Ok "(d) the rejection names the allowed modes" } else { Bad "(d) stderr: $($r.Stderr)" }
+    Test-Rejected "(g) nonexistent -Path" (Invoke-DryRun @("-Path", (Join-Path $here "no-such-dir")))
+    Test-Rejected "(h) -NoMenu -FromBat" (Invoke-DryRun @("-Path", $here, "-FromBat"))
+    Test-Rejected "(i) no -Path" (Invoke-DryRun @())
+} finally {
+    $env:USERPROFILE = $realProfile
+    if ($null -eq $prevClaudeCode) { Remove-Item env:CLAUDECODE -ErrorAction SilentlyContinue } else { $env:CLAUDECODE = $prevClaudeCode }
+}
+if ((Get-Sha $seededState) -eq $seededHash -and (Get-Sha $realState) -eq $realHash) { Ok "(f) claude-launcher.json unchanged (seeded and real)" }
+else { Bad "(f) a -NoMenu run rewrote claude-launcher.json" }
+Remove-Item $profileDir -Recurse -Force -ErrorAction SilentlyContinue
+
 $out.Add("")
 $out.Add("=== fixture ===")
 if (Test-Path $fixture) { Remove-Item $fixture -Recurse -Force }

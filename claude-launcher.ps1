@@ -1,4 +1,5 @@
-﻿param([switch]$FromBat, [switch]$SelfTest)
+﻿param([switch]$FromBat, [switch]$SelfTest,
+      [switch]$NoMenu, [string]$Path, [string]$Model, [string]$Mode, [string]$Effort, [string]$PromptHex, [switch]$DryRun)
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -476,6 +477,142 @@ function Get-EffortOptions {
     return $opts
 }
 
+function Get-ModelTier {
+    param([string]$id)
+    $lower = "$id".ToLower()
+    foreach ($tier in $ModelTiers) {
+        if ($lower.Contains($tier)) { return $tier }
+    }
+    return ""
+}
+
+# opusplan runs Sonnet outside plan mode, so it is NOT xhigh-capable despite the "opus" substring.
+# Which families do support xhigh comes from the catalog, not a list kept here: Sonnet 5 does,
+# and hard-coding Opus/Fable would send it to Opus for no reason.
+function Test-XhighCapable {
+    param([string]$Model)
+    $rec = Get-ModelEffort $Model
+    $tier = Get-ModelTier $Model
+    return ($Model -notlike "opusplan*") -and $(if ($rec) { @($rec.levels) -contains "xhigh" } else { $tier -eq "opus" -or $tier -eq "fable" })
+}
+
+# --effort accepts only low/medium/high/xhigh/max, so these two reach claude as a --settings
+# overlay. ultracode = xhigh + standing dynamic workflows (verified to activate ultracode on an
+# Opus model). Separate files so a delayed .bat launch can't read the other one's payload.
+$EffortOverlays = @{
+    "auto"      = @{ file = "claude_launch_effort.json";           json = '{"effortLevel":"auto"}' }
+    "ultracode" = @{ file = "claude_launch_effort_ultracode.json"; json = '{"effortLevel":"xhigh","ultracode":true,"enableWorkflows":true}' }
+}
+
+function Get-LaunchFlags {
+    param([string]$Permission, [string]$Model, [string]$Effort)
+    $flags = @()
+    if ($Permission) { $flags += @("--permission-mode", $Permission) }
+    if ($Model)      { $flags += @("--model", $Model) }
+    if ($Effort -and $EffortOverlays.ContainsKey($Effort)) { $flags += @("--settings", (Join-Path $env:TEMP $EffortOverlays[$Effort].file)) }
+    elseif ($Effort) { $flags += @("--effort", $Effort) }
+    return $flags
+}
+
+function Write-EffortOverlay {
+    param([string]$Effort)
+    if (-not $Effort -or -not $EffortOverlays.ContainsKey($Effort)) { return }
+    [System.IO.File]::WriteAllText((Join-Path $env:TEMP $EffortOverlays[$Effort].file), $EffortOverlays[$Effort].json, [System.Text.UTF8Encoding]::new($false))
+}
+
+# One argument quoted for the callee's MSVCRT parser: backslashes are literal except in a run
+# that ends at a `"` -- an escaped one inside, or the closing one -- where each must be doubled.
+function ConvertTo-NativeArgument {
+    param([string]$Arg)
+    return '"' + (($Arg -replace '(\\*)"', '$1$1\"') -replace '(\\+)\z', '$1$1') + '"'
+}
+
+# Windows PowerShell 5.1 wraps a native argument in quotes only when it finds whitespace after an
+# even number of `"` -- escaped or not -- so a prompt like `"fix this"` would reach claude split in
+# two. --% passes the command line verbatim instead; the %var% it expands is not expanded again,
+# so a prompt holding `%PATH%` stays literal.
+function Invoke-NativeArgv {
+    param([string]$Exe, [string[]]$Argv)
+    if (@($Argv).Count -eq 0) { & $Exe; return }
+    $env:CLAUDE_LAUNCHER_ARGV = @($Argv | ForEach-Object { ConvertTo-NativeArgument $_ }) -join " "
+    & $Exe --% %CLAUDE_LAUNCHER_ARGV%
+}
+
+# -NoMenu's whole contract in one place, so -SelfTest can check it against the fixture catalog.
+# Returns @{ Error } on rejection, otherwise @{ Cwd; Argv; Effort } with Argv unescaped. An option
+# left out adds no flag at all: the session inherits settings.json, never the menu default or a
+# per-path saved choice.
+function Resolve-NoMenuLaunch {
+    param([switch]$NoMenu, [switch]$FromBat, [switch]$DryRun, [string]$Path, [string]$Model, [string]$Mode,
+          [string]$Effort, [string]$PromptHex, [string[]]$ModelKeys, $PermModes, [string]$SettingsModel, $Catalog)
+    # Get-ModelEffort reads $claudeModels by name; this local is what it sees from here down.
+    $claudeModels = $Catalog
+    $given = @("Path", "Model", "Mode", "Effort", "PromptHex", "DryRun" | Where-Object { $PSBoundParameters.ContainsKey($_) })
+    if (-not $NoMenu) { return @{ Error = "-$($given -join ', -') requires -NoMenu" } }
+    if ($FromBat) { return @{ Error = "-NoMenu cannot be combined with -FromBat" } }
+    if (-not $Path) { return @{ Error = "-NoMenu requires -Path <existing directory>" } }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return @{ Error = "-Path is not an existing directory: $Path" } }
+
+    $modeKeys = @($PermModes | ForEach-Object { $_.key } | Where-Object { $_ })
+    if ($Mode -and $modeKeys -cnotcontains $Mode) { return @{ Error = "unknown -Mode '$Mode'; allowed: $($modeKeys -join ', ')" } }
+    if ($Model -and $ModelKeys -cnotcontains $Model) { return @{ Error = "unknown -Model '$Model'; allowed: $($ModelKeys -join ', ')" } }
+
+    # The menu's ultracode fallback runs first, so ultracode on a model without xhigh launches Opus
+    # instead of being rejected against the requested model's ladder.
+    if ($Effort -eq "ultracode") {
+        $effModel = if ($Model) { $Model } else { $SettingsModel }
+        if (-not (Test-XhighCapable $effModel)) { $Model = "opus" }
+    }
+    if ($Effort) {
+        $effModel = if ($Model) { $Model } else { $SettingsModel }
+        $levels = @(Get-EffortOptions $effModel | ForEach-Object { $_.key } | Where-Object { $_ })
+        if ($levels -cnotcontains $Effort) {
+            $shown = if ($effModel) { $effModel } else { "inherited model" }
+            return @{ Error = "-Effort '$Effort' is not offered for $shown; allowed: $($levels -join ', ')" }
+        }
+    }
+
+    $prompt = $null
+    if ($PSBoundParameters.ContainsKey("PromptHex")) {
+        if ($PromptHex -notmatch '^([0-9a-fA-F]{2})+$') { return @{ Error = "-PromptHex must be non-empty, even-length hex (UTF-8 bytes)" } }
+        $bytes = [byte[]]@(for ($i = 0; $i -lt $PromptHex.Length; $i += 2) { [Convert]::ToByte($PromptHex.Substring($i, 2), 16) })
+        try { $prompt = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes) }
+        catch { return @{ Error = "-PromptHex is not valid UTF-8" } }
+        # A NUL ends a Windows command line, so the prompt would arrive silently truncated.
+        if (-not $prompt -or $prompt.Contains([char]0)) { return @{ Error = "-PromptHex decodes to an empty prompt or one containing NUL" } }
+    }
+
+    $argv = @(Get-LaunchFlags -Permission $Mode -Model $Model -Effort $Effort)
+    if ($null -ne $prompt) { $argv += @("--", $prompt) }
+    return @{ Error = $null; Cwd = (Resolve-Path -LiteralPath $Path).ProviderPath; Argv = $argv; Effort = $Effort }
+}
+
+# Removes the CLAUDE* variables a Claude session leaves in its children (session id, messaging
+# socket, CLAUDECODE ...), which the launched claude would otherwise read as its own. Persistent
+# User/Machine values stay; settings.json env values are re-applied by claude at startup. Returns
+# the names that are actually gone afterwards, so -DryRun reports what removal did, not what it meant to do.
+function Remove-SessionClaudeVars {
+    $names = @(Get-ChildItem env: | Where-Object { $_.Name -like "CLAUDE*" } | ForEach-Object { $_.Name } |
+               Where-Object { $null -eq [Environment]::GetEnvironmentVariable($_, "User") -and $null -eq [Environment]::GetEnvironmentVariable($_, "Machine") })
+    foreach ($n in $names) { Remove-Item -LiteralPath "env:$n" }
+    return @($names | Where-Object { -not (Test-Path -LiteralPath "env:$_") } | Sort-Object)
+}
+
+$permInheritDesc  = "Claude Code default"
+$permModes = @(
+    @{ key=$null;               label="inherit";           desc=$permInheritDesc;                                          color=$WH }
+    @{ key="default";           label="default";           desc="Requires manual approval for unmatched tools";            color=$WH }
+    @{ key="plan";              label="plan";              desc="Planning only — no tool execution";                        color="$ESC[38;2;$($t.planMode)m" }
+    @{ key="acceptEdits";       label="acceptEdits";       desc="Auto-approve file edits and filesystem commands";         color="$ESC[38;2;$($t.autoAccept)m" }
+    @{ key="dontAsk";           label="dontAsk";           desc="Deny any tool not explicitly pre-approved";               color=$IN }
+    @{ key="auto";              label="auto";              desc="Model classifier auto-approves safe actions";             color=$OR }
+    @{ key="bypassPermissions"; label="bypassPermissions"; desc="Bypass all permission checks (trusted environments only)"; color="$ESC[38;2;$($t.error)m" }
+)
+$permDefaultIndex = 0
+for ($i = 0; $i -lt $permModes.Count; $i++) {
+    if ($permModes[$i].key -eq "bypassPermissions") { $permDefaultIndex = $i; break }
+}
+
 if ($SelfTest) {
     $colorStatePath = Join-Path $env:TEMP "claude_launcher_colors_selftest.json"
     Remove-Item $colorStatePath -ErrorAction SilentlyContinue
@@ -670,17 +807,35 @@ if ($SelfTest) {
     $claudeModels = $null
     if (Parse-ModelCatalog ($catFixture -replace 'aliases:\{', 'aliases:{}x') "") { throw "SelfTest: a catalog with no alias table must return nothing" }
 
+    # -NoMenu, against the same fixture: in the fixture Haiku has no effort control and Opus has xhigh.
+    $nm = @{ NoMenu = $true; Path = $PSScriptRoot; ModelKeys = $ModelTiers; PermModes = $permModes; SettingsModel = ""; Catalog = $cat }
+    function Join-Argv($r) { if ($r.Error) { "error: $($r.Error)" } else { @($r.Argv) -join "|" } }
+    $r = Resolve-NoMenuLaunch @nm
+    if ($r.Error -or @($r.Argv).Count -ne 0 -or $r.Effort) { throw "SelfTest: (a) -NoMenu with every option omitted must pass no flag at all, got [$(Join-Argv $r)]" }
+    $r = Resolve-NoMenuLaunch @nm -Model sonnet -Mode plan
+    if ((Join-Argv $r) -cne "--permission-mode|plan|--model|sonnet") { throw "SelfTest: (b) -Model sonnet -Mode plan gave [$(Join-Argv $r)]" }
+    $ultra = Join-Path $env:TEMP "claude_launch_effort_ultracode.json"
+    $r = Resolve-NoMenuLaunch @nm -Model haiku -Effort ultracode
+    if ((Join-Argv $r) -cne "--model|opus|--settings|$ultra" -or $r.Effort -ne "ultracode") { throw "SelfTest: (c) ultracode on Haiku must launch Opus with the ultracode overlay, got [$(Join-Argv $r)]" }
+    $r = Resolve-NoMenuLaunch @nm -Model haiku -Effort xhigh
+    if ($r.Error -notmatch 'allowed: auto$') { throw "SelfTest: (j) xhigh on Haiku must be rejected naming the allowed levels, got [$(Join-Argv $r)]" }
+    $r = Resolve-NoMenuLaunch @nm -Model sonnet -PromptHex "68656c6c6f20776f726c64"
+    if ((Join-Argv $r) -cne "--model|sonnet|--|hello world") { throw "SelfTest: (k) the decoded prompt must follow -- as the last argument, got [$(Join-Argv $r)]" }
+    if (-not (Resolve-NoMenuLaunch @nm -PromptHex "686").Error) { throw "SelfTest: odd-length -PromptHex was accepted" }
+    if (-not (Resolve-NoMenuLaunch @nm -PromptHex "").Error) { throw "SelfTest: an empty -PromptHex was accepted" }
+
+    # (e) A prompt has to survive the real PS 5.1 -> MSVCRT hop, through the same call the launch
+    # makes. python parses its command line the way claude.exe does and echoes argv as ASCII JSON.
+    $adversarial = @("한글 프롬프트", "two words", "a;b", "%PATH%", "a & b", 'say "hi"', 'a "b c" d', 'trail\', 'C:\dir with space\',
+                     "-x", "line1`nline2", "/help", '"fix this"', 'q\"x y', 'back\\"slash y')
+    foreach ($p in $adversarial) {
+        $echo = Invoke-NativeArgv python @("-c", "import sys,json;print(json.dumps(sys.argv[1:]))", $p)
+        $back = @(foreach ($x in ($echo | ConvertFrom-Json)) { $x })
+        if ($back.Count -ne 1 -or $back[0] -cne $p) { throw "SelfTest: (e) [$p] reached the child as $echo" }
+    }
+
     Write-Host "SelfTest OK"
     exit 0
-}
-
-function Get-ModelTier {
-    param([string]$id)
-    $lower = "$id".ToLower()
-    foreach ($tier in $ModelTiers) {
-        if ($lower.Contains($tier)) { return $tier }
-    }
-    return ""
 }
 
 function Get-EffortKey {
@@ -736,7 +891,9 @@ function Get-ModelCatalog {
             if ($ok) { return $cached }
         }
     } catch {}
-    Write-Host "Reading the model catalog from $(Split-Path $exe -Leaf)..."
+    # -NoMenu's stdout ends in the -DryRun JSON line a caller parses; keep it free of chatter.
+    $notice = "Reading the model catalog from $(Split-Path $exe -Leaf)..."
+    if ($NoMenu) { [Console]::Error.WriteLine($notice) } else { Write-Host $notice }
     # 28591 is Latin-1: [Text.Encoding]::Latin1 does not exist on the PS 5.1 the .bat starts.
     $cat = try { Parse-ModelCatalog ([Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))) $provider } catch { $null }
     $entry = if ($cat) { @{ stamp = $stamp; latest = $cat.latest; names = $cat.names; effort = $cat.effort } } else { @{ stamp = $stamp; failed = $true } }
@@ -763,7 +920,8 @@ $corg    = ""
 $subname = "Claude API"
 $modelLine = ""
 try {
-    $auth = claude auth status 2>$null | ConvertFrom-Json
+    # -NoMenu draws no header, so it skips the probe; a $null $auth takes the same path as a failed one.
+    $auth = if (-not $NoMenu) { claude auth status 2>$null | ConvertFrom-Json }
     $cemail = $auth.email
     if ($auth.orgName) { $corg = $auth.orgName }
     $subMap = @{
@@ -830,7 +988,6 @@ if (-not $modelDisplay) {
     $modelDisplay = Format-ModelLabel $modelDisplay
 }
 
-$permInheritDesc  = "Claude Code default"
 $modelInheritVal  = Format-ModelLabel $settingsModel
 $modelInheritDesc = if ($modelInheritVal)    { "$modelInheritVal (Use settings.json value)" }    else { "Use settings.json value" }
 $effortInheritDesc = if ($settingsEffort)    { "$settingsEffort (Use settings.json value)" }      else { "Use settings.json value" }
@@ -861,7 +1018,7 @@ $modelLine = if ($modelDisplay -or $effortDisplay) {
 # --- Discover known projects from ~/.claude/projects/ ---
 $projectsDir = Join-Path $env:USERPROFILE ".claude\projects"
 $knownPaths = @()
-if (Test-Path $projectsDir) {
+if (-not $NoMenu -and (Test-Path $projectsDir)) {
     Get-ChildItem -Path $projectsDir -Directory | ForEach-Object {
         $encoded = $_.Name
         # Decode: X-- → X:\, -- → \., - → \
@@ -1098,16 +1255,6 @@ function Browse-Directory {
 }
 
 # --- Option lists for tabbed config ---
-$permModes = @(
-    @{ key=$null;               label="inherit";           desc=$permInheritDesc;                                          color=$WH }
-    @{ key="default";           label="default";           desc="Requires manual approval for unmatched tools";            color=$WH }
-    @{ key="plan";              label="plan";              desc="Planning only — no tool execution";                        color="$ESC[38;2;$($t.planMode)m" }
-    @{ key="acceptEdits";       label="acceptEdits";       desc="Auto-approve file edits and filesystem commands";         color="$ESC[38;2;$($t.autoAccept)m" }
-    @{ key="dontAsk";           label="dontAsk";           desc="Deny any tool not explicitly pre-approved";               color=$IN }
-    @{ key="auto";              label="auto";              desc="Model classifier auto-approves safe actions";             color=$OR }
-    @{ key="bypassPermissions"; label="bypassPermissions"; desc="Bypass all permission checks (trusted environments only)"; color="$ESC[38;2;$($t.error)m" }
-)
-
 $models = @(
     @{ key = $null; label = "inherit"; desc = $modelInheritDesc; color = $WH }
 )
@@ -1142,10 +1289,6 @@ $extrasCatalog = @(
     @{ key = "bgcolor";  label = "Background"; desc = "Background tint";                                     type = "color"; kind = "bg"  }
 )
 
-$permDefaultIndex = 0
-for ($i = 0; $i -lt $permModes.Count; $i++) {
-    if ($permModes[$i].key -eq "bypassPermissions") { $permDefaultIndex = $i; break }
-}
 $modelDefaultIndex  = 0
 $effortDefaultIndex = 0
 
@@ -1495,6 +1638,35 @@ function Show-TabbedConfig {
     }
 }
 
+$noMenuArgs = @{}
+foreach ($k in "Path", "Model", "Mode", "Effort", "PromptHex", "DryRun") {
+    if ($PSBoundParameters.ContainsKey($k)) { $noMenuArgs[$k] = $PSBoundParameters[$k] }
+}
+if ($NoMenu -or $noMenuArgs.Count -gt 0) {
+    $launch = Resolve-NoMenuLaunch @noMenuArgs -NoMenu:$NoMenu -FromBat:$FromBat -SettingsModel $settingsModel -Catalog $claudeModels `
+                                   -ModelKeys @($models | ForEach-Object { $_.key } | Where-Object { $_ }) -PermModes $permModes
+    if ($launch.Error) { [Console]::Error.WriteLine("claude-launcher: $($launch.Error)"); exit 1 }
+    $envRemoved = Remove-SessionClaudeVars
+    if ($DryRun) {
+        $inheritedMode = $null
+        try { $inheritedMode = (Get-Content (Join-Path $env:USERPROFILE ".claude\settings.json") -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json).permissions.defaultMode } catch {}
+        $report = [ordered]@{
+            cwd           = $launch.Cwd
+            argv          = @($launch.Argv)
+            env           = [ordered]@{ EFFORT_LEVEL = $(if ($launch.Effort) { $launch.Effort } else { $null }) }
+            envRemoved    = @($envRemoved)
+            inheritedMode = $inheritedMode
+        }
+        [Console]::Out.WriteLine(($report | ConvertTo-Json -Compress -Depth 4))
+        exit 0
+    }
+    Write-EffortOverlay $launch.Effort
+    Set-Location -LiteralPath $launch.Cwd
+    if ($launch.Effort) { $env:EFFORT_LEVEL = $launch.Effort }
+    Invoke-NativeArgv claude $launch.Argv
+    exit $LASTEXITCODE
+}
+
 # --- Main loop ---
 $selectedPermission = $null
 $selectedModel = $null
@@ -1608,37 +1780,14 @@ Save-PathChoices -Path $selectedPath -Permission $selectedPermission -Model $sel
 $ultraForcedFrom = $null
 if ($selectedEffort -eq "ultracode") {
     $effModel = if ($selectedModel) { $selectedModel } else { $settingsModel }
-    # opusplan runs Sonnet outside plan mode, so it is NOT xhigh-capable despite the "opus" substring.
-    # Which families do support xhigh comes from the catalog, not a list kept here: Sonnet 5 does,
-    # and hard-coding Opus/Fable would send it to Opus for no reason.
-    $effTier = Get-ModelTier $effModel
-    $effRec  = Get-ModelEffort $effModel
-    $isXhighCapable = ($effModel -notlike "opusplan*") -and $(if ($effRec) { @($effRec.levels) -contains "xhigh" } else { $effTier -eq "opus" -or $effTier -eq "fable" })
-    if (-not $isXhighCapable) {
+    if (-not (Test-XhighCapable $effModel)) {
         if ($selectedModel) { $ultraForcedFrom = $selectedModel }
         $selectedModel = "opus"
     }
 }
 
-$flags = @()
-if ($selectedPermission) { $flags += @("--permission-mode", $selectedPermission) }
-if ($selectedModel)      { $flags += @("--model", $selectedModel) }
-if ($selectedEffort -eq "auto") {
-    # --effort CLI accepts only low/medium/high/xhigh/max.
-    # Inject effortLevel=auto via --settings overlay so it resolves at session start.
-    $effortSettingsFile = Join-Path $env:TEMP "claude_launch_effort.json"
-    [System.IO.File]::WriteAllText($effortSettingsFile, '{"effortLevel":"auto"}', [System.Text.UTF8Encoding]::new($false))
-    $flags += @("--settings", $effortSettingsFile)
-} elseif ($selectedEffort -eq "ultracode") {
-    # ultracode = xhigh + standing dynamic workflows. --effort rejects it, so inject via --settings overlay
-    # (verified to activate ultracode on an Opus model). Separate file from the auto branch so a delayed
-    # .bat launch can't read the wrong payload.
-    $ultraSettingsFile = Join-Path $env:TEMP "claude_launch_effort_ultracode.json"
-    [System.IO.File]::WriteAllText($ultraSettingsFile, '{"effortLevel":"xhigh","ultracode":true,"enableWorkflows":true}', [System.Text.UTF8Encoding]::new($false))
-    $flags += @("--settings", $ultraSettingsFile)
-} elseif ($selectedEffort) {
-    $flags += @("--effort", $selectedEffort)
-}
+$flags = @(Get-LaunchFlags -Permission $selectedPermission -Model $selectedModel -Effort $selectedEffort)
+Write-EffortOverlay $selectedEffort
 foreach ($ekey in $selectedExtras) {
     $e = $extrasCatalog | Where-Object { $_.key -eq $ekey } | Select-Object -First 1
     if ($e -and $e.flag) { $flags += ($e.flag -split ' ') }

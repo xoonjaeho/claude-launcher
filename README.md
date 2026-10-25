@@ -9,6 +9,7 @@ session — permission mode, model, effort, and extras — from interactive menu
 |------|------|
 | `claude-launcher.bat` | Entry point. Runs the PowerShell script, then launches Claude Code in the chosen directory. |
 | `claude-launcher.ps1` | TUI menus, theme detection, and the launch logic. |
+| `SKILL.md` | Claude Code skill that drives `-NoMenu` (see [Claude skill](#claude-skill)). |
 
 `claude-launcher.bat` runs the script with `-FromBat`: the script writes the final
 command to `%TEMP%\claude_launch.bat`, and the wrapper calls it. Running
@@ -30,6 +31,58 @@ claude-launcher.bat
 
 > **Note:** if "Start in" is not cleared, the launcher always starts from the .bat's
 > original location.
+
+### Non-interactive (`-NoMenu`)
+
+Skips every menu and launches straight into `-Path`. This is how Claude starts a session
+for you (see [Claude skill](#claude-skill)).
+
+```
+powershell -NoProfile -File claude-launcher.ps1 -NoMenu -Path D:\work\app -Model sonnet -Mode plan -PromptHex 68656c6c6f
+```
+
+| Argument | Value | Omitted |
+|----------|-------|---------|
+| `-Path` | Existing directory to launch in | Required |
+| `-Model` | A family alias the Model tab lists (`opus`, `sonnet`, …) | No `--model`: settings.json applies |
+| `-Mode` | A Permission tab key (`default`, `plan`, `acceptEdits`, `dontAsk`, `auto`, `bypassPermissions`) | No `--permission-mode`: settings.json applies |
+| `-Effort` | A level the Effort tab offers for that model, after the ultracode → Opus switch | No effort flag |
+| `-PromptHex` | Opening prompt as hex of its UTF-8 bytes; placed after `--` as the last argument | No opening prompt |
+| `-DryRun` | Validate and print the launch instead of running it | — |
+
+- An omitted option never falls back to the menu default (`bypassPermissions`) or to the saved
+  per-path choice, and `-NoMenu` never writes [saved choices](#saved-choices).
+- Invalid input exits 1 with one stderr line naming the allowed values.
+- The prompt is hex so it passes unchanged through Git Bash, `wt.exe` (which splits on `;`) and
+  PowerShell. From Bash: `printf %s "$P" | od -An -v -tx1 | tr -d ' \n'`.
+- Before launching, `-NoMenu` removes every `CLAUDE*` environment variable that is not set
+  persistently (User or Machine). A session started from inside Claude Code would otherwise
+  inherit that session's id and messaging socket. Values from settings.json `env` come back
+  when claude starts.
+- `-NoMenu` skips the header probe (`claude auth status`), the tab/background colors and the
+  `.bat` path. It cannot be combined with `-FromBat`.
+
+`-DryRun` prints one compact JSON object as the last stdout line (a catalog notice goes to stderr):
+
+```
+{"cwd":"D:\\work\\app","argv":["--permission-mode","plan","--model","sonnet","--","hello"],"env":{"EFFORT_LEVEL":null},"envRemoved":["CLAUDECODE"],"inheritedMode":"auto"}
+```
+
+`argv` is the logical argument list, before quoting. `envRemoved` lists the variables removed.
+`inheritedMode` is `permissions.defaultMode` from `~/.claude/settings.json`, the mode in effect
+when `-Mode` is omitted.
+
+### Claude skill
+
+`SKILL.md` makes this launcher a Claude Code skill: ask Claude to open a session for a project
+and it runs `-DryRun`, then `-NoMenu` in a new Windows Terminal tab. Install:
+
+```
+mkdir %USERPROFILE%\.claude\skills\claude-launcher
+copy SKILL.md %USERPROFILE%\.claude\skills\claude-launcher\SKILL.md
+```
+
+Re-copy after changing `SKILL.md`.
 
 ## Screen
 
@@ -60,8 +113,8 @@ claude-launcher.bat
 
 | Command | Covers |
 |---------|--------|
-| `claude-launcher.ps1 -SelfTest` | The pure parts: INPUT_RECORD decoding, viewport clamping, tab-bar column ranges. Fast, no console needed. |
-| `claude-launcher.tests.ps1` | The rest: it starts a real launcher, writes console records into its input buffer, and reads the rendered screen back to assert. Runs `-SelfTest` first. |
+| `claude-launcher.ps1 -SelfTest` | The pure parts: INPUT_RECORD decoding, viewport clamping, tab-bar column ranges, `-NoMenu` argument resolution, and a prompt round trip through the real PowerShell → native-exe quoting (via `python`). Fast, no console needed. |
+| `claude-launcher.tests.ps1` | The rest: it starts a real launcher, writes console records into its input buffer, and reads the rendered screen back to assert. Runs `-SelfTest` first, then `-NoMenu -DryRun` as a plain subprocess against a seeded temporary profile. |
 
 The second one exists because the first cannot see a screen. Several defects found during the
 mouse work were invisible to `-SelfTest`: a `return ,$segs` that made

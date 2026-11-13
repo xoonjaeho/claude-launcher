@@ -77,8 +77,8 @@ $RD  = "$ESC[38;2;$($t.error)m"        # error
 $PR  = "$ESC[38;2;$($t.autoAccept)m"   # autoAccept / merged
 $IN  = "$ESC[38;2;$($t.inactive)m"     # inactive / secondary text
 
-# --- Effort & Model colors (fixed, matches statusline.py) ---
-# Kept independent of the theme map so the launcher and statusline agree visually.
+# --- Effort & Model colors (fixed) ---
+# Kept independent of the theme map so a statusline script can reuse the same palette.
 $EffortColors = @{
     "auto"   = "$ESC[38;2;125;207;255m"   # adaptive cyan
     "low"    = "$ESC[38;2;255;193;7m"     # warning amber
@@ -204,7 +204,7 @@ function Reserve-TabColor {
             try { $fs = [System.IO.File]::Open($colorStatePath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
             catch [System.IO.IOException] { Start-Sleep -Milliseconds 50 }
         }
-        # ponytail: a lost reservation only costs a duplicate color, so give up rather than
+        # A lost reservation only costs a duplicate color, so give up rather than
         # stall the launch behind another launcher that is wedged.
         if (-not $fs) { return }
         try {
@@ -225,7 +225,7 @@ function Reserve-TabColor {
 function Select-TabColor {
     param([string[]]$Used)
     $free = @($tabPalette | Where-Object { $Used -notcontains $_.name })
-    # ponytail: palette exhausted → reuse one; a duplicate beats no color at all.
+    # Palette exhausted → reuse one; a duplicate beats no color at all.
     if ($free.Count -eq 0) { $free = $tabPalette }
     return $free[(Get-Random -Maximum $free.Count)]
 }
@@ -313,7 +313,7 @@ function ConvertFrom-InputRecord {
             # window already pressed; DOUBLE_CLICK (2) would fire a second time on whatever screen
             # the first click just opened -- one physical double-click stays one action.
             if ($down -and -not $wasDown -and $flags -eq 0) {
-                # ponytail: dwMousePosition is documented as screen-BUFFER coordinates, the same
+                # dwMousePosition is documented as screen-BUFFER coordinates, the same
                 # space as [Console]::CursorTop. Should a host ever report window-relative rows,
                 # adding [Console]::WindowTop to Row right here is the entire fix.
                 return @{ Kind = "click"
@@ -1793,8 +1793,8 @@ foreach ($ekey in $selectedExtras) {
     if ($e -and $e.flag) { $flags += ($e.flag -split ' ') }
 }
 
-# statusline reads EFFORT_LEVEL; pass the selected level through verbatim so an ultracode
-# launch renders as "ultracode" (statusline handles it as a known key now).
+# A statusline script may read EFFORT_LEVEL; pass the selected level through verbatim so an
+# ultracode launch shows as "ultracode" there.
 $effortEnv = $selectedEffort
 
 # --- Terminal colors (Extras > Tab color / Background) ---

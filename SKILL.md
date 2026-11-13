@@ -38,7 +38,7 @@ Pass only what the user asked for. Never fill an option the user did not state.
 2. **Dry run** from Bash with the same arguments plus `-DryRun`. Single-quote every Windows path:
 
    ```bash
-   powershell -NoProfile -File 'D:\repository\claude-launcher\claude-launcher.ps1' \
+   powershell -NoProfile -File '<launcher-dir>\claude-launcher.ps1' \
      -NoMenu -DryRun -Path '<dir>' [-Model <alias>] [-Mode <mode>] [-Effort <level>] [-PromptHex "$HEX"]
    ```
 
@@ -53,7 +53,7 @@ Pass only what the user asked for. Never fill an option the user did not state.
 
    ```bash
    MSYS_NO_PATHCONV=1 wt.exe -w 0 new-tab -d '<dir>' --title '<project>' \
-     powershell -NoProfile -ExecutionPolicy Bypass -File 'D:\repository\claude-launcher\claude-launcher.ps1' \
+     powershell -NoProfile -ExecutionPolicy Bypass -File '<launcher-dir>\claude-launcher.ps1' \
      -NoMenu -Path '<dir>' [-Model <alias>] [-Mode <mode>] [-Effort <level>] [-PromptHex "$HEX"]
    ```
 

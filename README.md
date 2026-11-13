@@ -82,7 +82,8 @@ mkdir %USERPROFILE%\.claude\skills\claude-launcher
 copy SKILL.md %USERPROFILE%\.claude\skills\claude-launcher\SKILL.md
 ```
 
-Re-copy after changing `SKILL.md`.
+In the copy, replace `<launcher-dir>` with the absolute path of this clone. Re-copy after changing
+`SKILL.md`.
 
 ## Screen
 

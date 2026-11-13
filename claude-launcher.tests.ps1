@@ -379,9 +379,7 @@ Scenario "config: the keyboard path launches the same way a click does" {
     if ($bat -notmatch 'cd /d') { Bad "Enter did not launch"; return }
     Ok "Enter launched"
     # Same Get-Result that a click goes through, so this pins the keyboard half of that shared exit.
-    if ($bat -match '--permission-mode') { Bad "'inherit' still passed a permission flag: $($bat -replace '
-?
-', ' | ')" }
+    if ($bat -match '--permission-mode') { Bad "'inherit' still passed a permission flag: $($bat -replace '\r?\n', ' | ')" }
     else { Ok "the keyboard-picked item is what got launched" }
 }
 

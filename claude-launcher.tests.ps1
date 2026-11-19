@@ -266,6 +266,34 @@ try {
     Test-Rejected "(g) nonexistent -Path" (Invoke-DryRun @("-Path", (Join-Path $here "no-such-dir")))
     Test-Rejected "(h) -NoMenu -FromBat" (Invoke-DryRun @("-Path", $here, "-FromBat"))
     Test-Rejected "(i) no -Path" (Invoke-DryRun @())
+
+    $codeModeVar = "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"
+    $r = Invoke-DryRun @("-Path", $here, "-CodeMode")
+    if ($r.Code -eq 0 -and $r.Json.env.$codeModeVar -eq "1") { Ok "(n) -CodeMode is reported as env.$codeModeVar = 1" }
+    else { Bad "(n) exit $($r.Code), env.$codeModeVar=$($r.Json.env.$codeModeVar), stderr: $($r.Stderr)" }
+    $r = Invoke-DryRun @("-Path", $here)
+    if ($r.Code -eq 0 -and $null -eq $r.Json.env.$codeModeVar) { Ok "(n) without -CodeMode the variable is not reported" }
+    else { Bad "(n) env.$codeModeVar=$($r.Json.env.$codeModeVar) without -CodeMode" }
+    # Invoke-DryRun always passes -NoMenu, so the switch alone goes through a plain call.
+    $lines = @(& powershell -NoProfile -File $Launcher -CodeMode -Path $here 2>&1); $code = $LASTEXITCODE
+    if ($code -eq 1 -and ($lines -join " ") -match 'requires -NoMenu') { Ok "(o) -CodeMode without -NoMenu -> exit 1 naming -NoMenu" }
+    else { Bad "(o) exit $code, output: $($lines -join ' | ')" }
+
+    # The variable has to survive Remove-SessionClaudeVars (it matches CLAUDE*) and reach the child.
+    # A stand-in claude first on PATH echoes what it sees, so no real session starts.
+    $fakeDir = Join-Path $env:TEMP "tmp_fake_claude"
+    New-Item -ItemType Directory -Path $fakeDir -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $fakeDir "claude.cmd"), "@echo CODEMODE=[%$codeModeVar%]`r`n", $utf8)
+    $prevPath = $env:PATH
+    try {
+        $env:PATH = "$fakeDir;$prevPath"
+        $withMode = @(& powershell -NoProfile -File $Launcher -NoMenu -Path $here -CodeMode 2>&1) -join " "
+        $without  = @(& powershell -NoProfile -File $Launcher -NoMenu -Path $here 2>&1) -join " "
+    } finally { $env:PATH = $prevPath; Remove-Item $fakeDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($withMode -match 'CODEMODE=\[1\]') { Ok "(p) the child claude sees $codeModeVar=1 after the CLAUDE* cleanup" }
+    else { Bad "(p) child output: $withMode" }
+    if ($without -match 'CODEMODE=\[\]') { Ok "(p) without -CodeMode the child sees no $codeModeVar" }
+    else { Bad "(p) child output without -CodeMode: $without" }
 } finally {
     $env:USERPROFILE = $realProfile
     if ($null -eq $prevClaudeCode) { Remove-Item env:CLAUDECODE -ErrorAction SilentlyContinue } else { $env:CLAUDECODE = $prevClaudeCode }
@@ -498,6 +526,66 @@ Scenario "browse: a long list is windowed and the wheel scrolls it" {
     Send-Wheel 120; Start-Sleep -Milliseconds 300
     $s2 = Get-Position
     if ($s2 -and $s2.First -eq 1) { Ok "scrolling past the top clamps" } else { Bad "the top clamp failed" }
+}
+
+# Code Mode scenarios run on the seeded profile with its saved choices cleared, so a Code Mode
+# launch is never written into the real per-path state and earlier scenarios cannot preselect it.
+$codeModeSet = 'set "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1"'
+function Open-ExtrasTab {
+    if ($noEffortProfile) { Remove-Item (Join-Path $noEffortProfile ".claude\claude-launcher.json") -ErrorAction SilentlyContinue }
+    if (-not (Wait-Boot)) { Bad "the launcher never drew its first menu"; return $false }
+    if (-not (Click-Row '^\s*\S*\s*1\..*\(current\)')) { Bad "no current-directory row to click"; return $false }
+    if (-not (Click-Row '\[ Permission \]' 'Extras')) { Bad "no tab bar to click"; return $false }
+    if (-not (Wait-Row '\[ Extras \]' 3000)) { Bad "the Extras tab did not open"; return $false }
+    return $true
+}
+function Show-BatTail($bat) { $bat -replace '\r?\n', ' | ' }
+
+Scenario "extras: Code Mode launches under setlocal with the variable set" -UserProfile $noEffortProfile {
+    if (-not (Open-ExtrasTab)) { return }
+    if (-not (Click-Row '\d+\. \[.\] Code Mode')) { Bad "no Code Mode row"; return }
+    if (-not (Wait-Row '\[x\] Code Mode' 3000)) { Bad "Code Mode did not toggle on"; return }
+    if (Wait-Row 'disconnects Remote Control' 2000) { Ok "the row explains that Code Mode disconnects Remote Control" }
+    else { Bad "no Remote Control note under the Code Mode row" }
+    Send-Key 13
+    $bat = Get-LaunchBat
+    if ($bat -match '(?s)cd /d "[^"\r\n]*"\r\nsetlocal\r\n' + [regex]::Escape($codeModeSet) + '\r\nclaude') { Ok "bat: cd, setlocal, set Code Mode, claude" }
+    else { Bad "bat was: $(Show-BatTail $bat)" }
+}
+
+Scenario "extras: without Code Mode the bat sets no Code Mode variable" -UserProfile $noEffortProfile {
+    if (-not (Open-ExtrasTab)) { return }
+    Send-Key 13
+    $bat = Get-LaunchBat
+    if ($bat -notmatch 'cd /d') { Bad "Enter did not launch"; return }
+    if ($bat -match '(?s)cd /d "[^"\r\n]*"\r\nsetlocal\r\nclaude') { Ok "bat keeps setlocal and carries no Code Mode line" }
+    else { Bad "bat was: $(Show-BatTail $bat)" }
+}
+
+Scenario "extras: Code Mode is refused while Remote is on" -UserProfile $noEffortProfile {
+    if (-not (Open-ExtrasTab)) { return }
+    if (-not (Click-Row '\d+\. \[.\] Remote')) { Bad "no Remote row"; return }
+    if (-not (Wait-Row '\[x\] Remote' 3000)) { Bad "Remote did not toggle on"; return }
+    if (-not (Click-Row '\d+\. \[.\] Code Mode')) { Bad "no Code Mode row"; return }
+    if (Wait-Row 'Code Mode cannot be combined with Remote' 3000) { Ok "the refusal names Remote" } else { Bad "no refusal shown" }
+    if (Wait-Row '\[x\] Code Mode' 800) { Bad "Code Mode got selected next to Remote"; return }
+    Send-Key 13
+    $bat = Get-LaunchBat
+    if ($bat -match '--remote-control' -and $bat -notmatch 'CODE_MODE') { Ok "launched with Remote and without Code Mode" }
+    else { Bad "bat was: $(Show-BatTail $bat)" }
+}
+
+Scenario "extras: Chrome is refused while Code Mode is on" -UserProfile $noEffortProfile {
+    if (-not (Open-ExtrasTab)) { return }
+    if (-not (Click-Row '\d+\. \[.\] Code Mode')) { Bad "no Code Mode row"; return }
+    if (-not (Wait-Row '\[x\] Code Mode' 3000)) { Bad "Code Mode did not toggle on"; return }
+    if (-not (Click-Row '\d+\. \[.\] Chrome')) { Bad "no Chrome row"; return }
+    if (Wait-Row 'Chrome cannot be combined with Code Mode' 3000) { Ok "the refusal names Code Mode" } else { Bad "no refusal shown" }
+    if (Wait-Row '\[x\] Chrome' 800) { Bad "Chrome got selected next to Code Mode"; return }
+    Send-Key 13
+    $bat = Get-LaunchBat
+    if ($bat -match [regex]::Escape($codeModeSet) -and $bat -notmatch '--chrome') { Ok "launched with Code Mode and without Chrome" }
+    else { Bad "bat was: $(Show-BatTail $bat)" }
 }
 
 

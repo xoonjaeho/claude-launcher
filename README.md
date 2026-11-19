@@ -48,6 +48,7 @@ powershell -NoProfile -File claude-launcher.ps1 -NoMenu -Path D:\work\app -Model
 | `-Mode` | A Permission tab key (`default`, `plan`, `acceptEdits`, `dontAsk`, `auto`, `bypassPermissions`) | No `--permission-mode`: settings.json applies |
 | `-Effort` | A level the Effort tab offers for that model, after the ultracode → Opus switch | No effort flag |
 | `-PromptHex` | Opening prompt as hex of its UTF-8 bytes; placed after `--` as the last argument | No opening prompt |
+| `-CodeMode` | Start Claude Code's experimental Code Mode (sets `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1` for the session; Remote Control, Chrome and computer use are off in it) | Code Mode off |
 | `-DryRun` | Validate and print the launch instead of running it | — |
 
 - An omitted option never falls back to the menu default (`bypassPermissions`) or to the saved
@@ -65,10 +66,12 @@ powershell -NoProfile -File claude-launcher.ps1 -NoMenu -Path D:\work\app -Model
 `-DryRun` prints one compact JSON object as the last stdout line (a catalog notice goes to stderr):
 
 ```
-{"cwd":"D:\\work\\app","argv":["--permission-mode","plan","--model","sonnet","--","hello"],"env":{"EFFORT_LEVEL":null},"envRemoved":["CLAUDECODE"],"inheritedMode":"auto"}
+{"cwd":"D:\\work\\app","argv":["--permission-mode","plan","--model","sonnet","--","hello"],"env":{"EFFORT_LEVEL":null,"CLAUDE_CODE_EXPERIMENTAL_CODE_MODE":null},"envRemoved":["CLAUDECODE"],"inheritedMode":"auto"}
 ```
 
-`argv` is the logical argument list, before quoting. `envRemoved` lists the variables removed.
+`argv` is the logical argument list, before quoting. `env` lists variables the launch sets; with
+`-CodeMode`, `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE` is `"1"`. The variable is set after the `CLAUDE*`
+cleanup, which would otherwise remove it. `envRemoved` lists the variables removed.
 `inheritedMode` is `permissions.defaultMode` from `~/.claude/settings.json`, the mode in effect
 when `-Mode` is omitted.
 
@@ -323,6 +326,7 @@ is remembered per directory, so the tab comes back the way it was left.
 | **Chrome** | `--chrome` | Enable Chrome integration (beta) |
 | **Telegram** | `--channels plugin:telegram@claude-plugins-official` | Load the Telegram channel plugin |
 | **Remote** | `--remote-control` | Enable Remote Control (drive the session from another device) |
+| **Code Mode** | — (env `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`) | Experimental Code Mode. Cannot be combined with Remote or Chrome |
 | **Verbose** | `--verbose` | Verbose logging |
 | **Bare** | `--bare` | Skip hooks, LSP, plugins, and CLAUDE.md discovery |
 | **Safe** | `--safe-mode` | Disable all customizations for troubleshooting (broader than Bare) |
@@ -331,6 +335,16 @@ is remembered per directory, so the tab comes back the way it was left.
 | **Prompts** | `--prompt-suggestions` | Suggest a predicted next prompt each turn |
 | **Tab color** | — | Tab color, Windows Terminal only |
 | **Background** | — | Background tint |
+
+#### Code Mode
+
+Claude Code has no flag for Code Mode, only the variable. The menu launch sets it for the child
+process; the `-FromBat` launch writes `setlocal` after the `cd /d` line and `set "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1"`
+only when Code Mode is selected, so nothing leaks into the parent `cmd.exe`. Code Mode turns off
+Remote Control, Chrome and computer use, including Remote Control that settings.json enables, so
+the Extras tab refuses to select it together with Remote or Chrome (and the reverse). A saved
+choice that holds both keeps Remote and Chrome. The first launch shows Claude Code's own consent
+dialog in the terminal.
 
 #### Tab color and Background
 

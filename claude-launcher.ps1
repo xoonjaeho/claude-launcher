@@ -1,5 +1,5 @@
 ﻿param([switch]$FromBat, [switch]$SelfTest,
-      [switch]$NoMenu, [string]$Path, [string]$Model, [string]$Mode, [string]$Effort, [string]$PromptHex, [switch]$DryRun)
+      [switch]$NoMenu, [string]$Path, [string]$Model, [string]$Mode, [string]$Effort, [string]$PromptHex, [switch]$DryRun, [switch]$CodeMode)
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -539,15 +539,15 @@ function Invoke-NativeArgv {
 }
 
 # -NoMenu's whole contract in one place, so -SelfTest can check it against the fixture catalog.
-# Returns @{ Error } on rejection, otherwise @{ Cwd; Argv; Effort } with Argv unescaped. An option
+# Returns @{ Error } on rejection, otherwise @{ Cwd; Argv; Effort; CodeMode } with Argv unescaped. An option
 # left out adds no flag at all: the session inherits settings.json, never the menu default or a
 # per-path saved choice.
 function Resolve-NoMenuLaunch {
-    param([switch]$NoMenu, [switch]$FromBat, [switch]$DryRun, [string]$Path, [string]$Model, [string]$Mode,
+    param([switch]$NoMenu, [switch]$FromBat, [switch]$DryRun, [switch]$CodeMode, [string]$Path, [string]$Model, [string]$Mode,
           [string]$Effort, [string]$PromptHex, [string[]]$ModelKeys, $PermModes, [string]$SettingsModel, $Catalog)
     # Get-ModelEffort reads $claudeModels by name; this local is what it sees from here down.
     $claudeModels = $Catalog
-    $given = @("Path", "Model", "Mode", "Effort", "PromptHex", "DryRun" | Where-Object { $PSBoundParameters.ContainsKey($_) })
+    $given = @("Path", "Model", "Mode", "Effort", "PromptHex", "DryRun", "CodeMode" | Where-Object { $PSBoundParameters.ContainsKey($_) })
     if (-not $NoMenu) { return @{ Error = "-$($given -join ', -') requires -NoMenu" } }
     if ($FromBat) { return @{ Error = "-NoMenu cannot be combined with -FromBat" } }
     if (-not $Path) { return @{ Error = "-NoMenu requires -Path <existing directory>" } }
@@ -584,7 +584,18 @@ function Resolve-NoMenuLaunch {
 
     $argv = @(Get-LaunchFlags -Permission $Mode -Model $Model -Effort $Effort)
     if ($null -ne $prompt) { $argv += @("--", $prompt) }
-    return @{ Error = $null; Cwd = (Resolve-Path -LiteralPath $Path).ProviderPath; Argv = $argv; Effort = $Effort }
+    return @{ Error = $null; Cwd = (Resolve-Path -LiteralPath $Path).ProviderPath; Argv = $argv; Effort = $Effort; CodeMode = $CodeMode.IsPresent }
+}
+
+# Code Mode has no CLI flag, only this variable; claude refuses any value but 1.
+$CodeModeEnvName = "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"
+
+# Code Mode switches Remote Control and Chrome off, so selecting the pair would promise what the
+# session cannot deliver. Returns the key of a selected extra that clashes with $Key, else $null.
+function Get-ExtraConflict {
+    param([string]$Key, $Selected)
+    $against = switch ($Key) { "codemode" { @("remote", "chrome") } "remote" { @("codemode") } "chrome" { @("codemode") } default { @() } }
+    return @($against | Where-Object { $Selected[$_] }) | Select-Object -First 1
 }
 
 # Removes the CLAUDE* variables a Claude session leaves in its children (session id, messaging
@@ -823,6 +834,16 @@ if ($SelfTest) {
     if ((Join-Argv $r) -cne "--model|sonnet|--|hello world") { throw "SelfTest: (k) the decoded prompt must follow -- as the last argument, got [$(Join-Argv $r)]" }
     if (-not (Resolve-NoMenuLaunch @nm -PromptHex "686").Error) { throw "SelfTest: odd-length -PromptHex was accepted" }
     if (-not (Resolve-NoMenuLaunch @nm -PromptHex "").Error) { throw "SelfTest: an empty -PromptHex was accepted" }
+
+    $r = Resolve-NoMenuLaunch @nm -CodeMode
+    if ($r.Error -or -not $r.CodeMode) { throw "SelfTest: -CodeMode must be accepted and reported, got [$(Join-Argv $r)]" }
+    if ((Resolve-NoMenuLaunch @nm).CodeMode) { throw "SelfTest: CodeMode reported without -CodeMode" }
+    if (-not (Resolve-NoMenuLaunch -CodeMode -Path $PSScriptRoot).Error) { throw "SelfTest: -CodeMode without -NoMenu was accepted" }
+    $sel = @{ remote = $true }
+    if ((Get-ExtraConflict "codemode" $sel) -ne "remote" -or (Get-ExtraConflict "codemode" @{ chrome = $true }) -ne "chrome") { throw "SelfTest: Code Mode did not clash with Remote/Chrome" }
+    if ((Get-ExtraConflict "remote" @{ codemode = $true }) -ne "codemode" -or (Get-ExtraConflict "chrome" @{ codemode = $true }) -ne "codemode") { throw "SelfTest: Remote/Chrome did not clash with Code Mode" }
+    if (Get-ExtraConflict "codemode" @{ verbose = $true }) { throw "SelfTest: Code Mode clashed with an unrelated extra" }
+    if (Get-ExtraConflict "remote" @{ chrome = $true }) { throw "SelfTest: Remote clashed with Chrome" }
 
     # (e) A prompt has to survive the real PS 5.1 -> MSVCRT hop, through the same call the launch
     # makes. python parses its command line the way claude.exe does and echoes argv as ASCII JSON.
@@ -1276,6 +1297,7 @@ $extrasCatalog = @(
     @{ key = "chrome";   label = "Chrome";   desc = "Enable Chrome integration (beta)";                     flag = "--chrome" }
     @{ key = "telegram"; label = "Telegram"; desc = "Load Telegram channel plugin";                         flag = "--channels plugin:telegram@claude-plugins-official" }
     @{ key = "remote";   label = "Remote";   desc = "Enable Remote Control (drive session from another device)"; flag = "--remote-control" }
+    @{ key = "codemode"; label = "Code Mode"; desc = "Experimental; turns off Remote, Chrome, computer use";   env = $CodeModeEnvName }
     # Diagnostics
     @{ key = "verbose";  label = "Verbose";  desc = "Enable verbose logging";                               flag = "--verbose" }
     @{ key = "bare";     label = "Bare";     desc = "Skip hooks, LSP, plugins, and CLAUDE.md discovery";    flag = "--bare" }
@@ -1393,11 +1415,14 @@ function Show-TabbedConfig {
     $extrasSelected = @{}
     $colorIdx  = @{ tab = -1;    bg = -1    }
     $colorPick = @{ tab = $null; bg = $null }
+    $ui = @{ note = $null }
 
     if ($null -ne $choices) {
         foreach ($k in $choices.extras) {
             if ($k -and ($extrasCatalog | Where-Object { $_.key -eq $k -and -not $_.type })) { $extrasSelected[$k] = $true }
         }
+        # A state file can hold the pair from before the exclusion existed; Remote and Chrome win.
+        if ($extrasSelected["codemode"] -and (Get-ExtraConflict "codemode" $extrasSelected)) { $extrasSelected.Remove("codemode") }
         foreach ($kind in @("tab", "bg")) {
             $saved = if ($kind -eq "tab") { $choices.tabColor } else { $choices.bgColor }
             if ($saved -eq "random") {
@@ -1437,7 +1462,13 @@ function Show-TabbedConfig {
         param($E)
         if ($E.type -eq "color")           { Step-Color $E.kind }
         elseif ($extrasSelected[$E.key])   { $extrasSelected.Remove($E.key) }
-        else                               { $extrasSelected[$E.key] = $true }
+        else {
+            $clash = Get-ExtraConflict $E.key $extrasSelected
+            if ($clash) {
+                $other = ($extrasCatalog | Where-Object { $_.key -eq $clash }).label
+                $ui.note = "$($E.label) cannot be combined with $other - turn $other off first"
+            } else { $extrasSelected[$E.key] = $true }
+        }
     }
 
     # Enter and a click both leave through here, so the two can never return different things.
@@ -1573,7 +1604,13 @@ function Show-TabbedConfig {
                 }
             }
         }
-        Write-Host "$ESC[K"
+        # The blank row above the selection line is free on every tab; on Extras it carries notes.
+        $note = $null
+        if ($tab.isMulti) {
+            $note = $ui.note
+            if (-not $note -and $extrasCatalog[$tab.cursor].key -eq "codemode") { $note = "Code Mode also disconnects Remote Control that settings.json enables" }
+        }
+        if ($note) { Write-Host "   ${OR}$note$R$ESC[K" } else { Write-Host "$ESC[K" }
         Write-Host "   $(Format-Selection)$ESC[K"
         $pick = if ($tab.isMulti) { "[Space/click] toggle" } else { "[1-9] jump" }
         # Click launches only on a single-select tab; an Extras row is a checkbox and its click
@@ -1589,6 +1626,7 @@ function Show-TabbedConfig {
         Render
         while ($true) {
             $ev = Read-Input
+            $ui.note = $null
             $tab = $tabs[$activeTab]
             $count = if ($tab.isMulti) { $extrasCatalog.Count } else { $tab.items.Count }
             if ($ev.Kind -eq "click") {
@@ -1639,7 +1677,7 @@ function Show-TabbedConfig {
 }
 
 $noMenuArgs = @{}
-foreach ($k in "Path", "Model", "Mode", "Effort", "PromptHex", "DryRun") {
+foreach ($k in "Path", "Model", "Mode", "Effort", "PromptHex", "DryRun", "CodeMode") {
     if ($PSBoundParameters.ContainsKey($k)) { $noMenuArgs[$k] = $PSBoundParameters[$k] }
 }
 if ($NoMenu -or $noMenuArgs.Count -gt 0) {
@@ -1653,7 +1691,8 @@ if ($NoMenu -or $noMenuArgs.Count -gt 0) {
         $report = [ordered]@{
             cwd           = $launch.Cwd
             argv          = @($launch.Argv)
-            env           = [ordered]@{ EFFORT_LEVEL = $(if ($launch.Effort) { $launch.Effort } else { $null }) }
+            env           = [ordered]@{ EFFORT_LEVEL = $(if ($launch.Effort) { $launch.Effort } else { $null })
+                                        $CodeModeEnvName = $(if ($launch.CodeMode) { "1" } else { $null }) }
             envRemoved    = @($envRemoved)
             inheritedMode = $inheritedMode
         }
@@ -1663,6 +1702,8 @@ if ($NoMenu -or $noMenuArgs.Count -gt 0) {
     Write-EffortOverlay $launch.Effort
     Set-Location -LiteralPath $launch.Cwd
     if ($launch.Effort) { $env:EFFORT_LEVEL = $launch.Effort }
+    # After Remove-SessionClaudeVars, which would have wiped it.
+    if ($launch.CodeMode) { Set-Item -LiteralPath "env:$CodeModeEnvName" -Value "1" }
     Invoke-NativeArgv claude $launch.Argv
     exit $LASTEXITCODE
 }
@@ -1796,6 +1837,7 @@ foreach ($ekey in $selectedExtras) {
 # A statusline script may read EFFORT_LEVEL; pass the selected level through verbatim so an
 # ultracode launch shows as "ultracode" there.
 $effortEnv = $selectedEffort
+$codeModeOn = $selectedExtras -contains "codemode"
 
 # --- Terminal colors (Extras > Tab color / Background) ---
 # Emitted from this console, so they are already in effect when claude takes over the same tab.
@@ -1836,7 +1878,9 @@ if ($FromBat) {
     $flagStr = if ($flags.Count -gt 0) { " " + ($flags -join " ") } else { "" }
     $envLine = if ($effortEnv) { "set `"EFFORT_LEVEL=$effortEnv`"`r`n" } else { "" }
     $noticeLine = if ($ultraForcedFrom) { "echo ultracode needs an xhigh-capable model - switched $ultraForcedFrom to opus.`r`ntimeout /t 2 /nobreak >NUL`r`n" } else { "" }
-    $launchBat = "@echo off`r`nchcp 65001 >NUL`r`ncls`r`n${noticeLine}${envLine}cd /d `"$safePath`"`r`nclaude$flagStr"
+    # setlocal keeps the Code Mode variable out of the cmd.exe that outlives this launch.
+    $codeModeLine = if ($codeModeOn) { "set `"$CodeModeEnvName=1`"`r`n" } else { "" }
+    $launchBat = "@echo off`r`nchcp 65001 >NUL`r`ncls`r`n${noticeLine}${envLine}cd /d `"$safePath`"`r`nsetlocal`r`n${codeModeLine}claude$flagStr"
     $tmpFile = Join-Path $env:TEMP "claude_launch.bat"
     [System.IO.File]::WriteAllText($tmpFile, $launchBat, [System.Text.UTF8Encoding]::new($false))
 } else {
@@ -1844,5 +1888,6 @@ if ($FromBat) {
     Clear-Host
     if ($ultraForcedFrom) { Write-Host "   ${OR}ultracode needs an xhigh-capable model — switched $ultraForcedFrom → opus.$R"; Write-Host ""; Start-Sleep -Seconds 2 }
     if ($effortEnv) { $env:EFFORT_LEVEL = $effortEnv }
+    if ($codeModeOn) { Set-Item -LiteralPath "env:$CodeModeEnvName" -Value "1" }
     if ($flags.Count -gt 0) { & claude @flags } else { & claude }
 }
